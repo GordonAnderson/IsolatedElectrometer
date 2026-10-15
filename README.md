@@ -47,7 +47,7 @@ GCLK4 (16 MHz)
 | Mode | Name | Description |
 |------|------|-------------|
 | 0 | Idle | Standard `analogRead()` on demand; no DMA running |
-| 1 | Vector acquire | DMA fills one buffer when a trigger event is received, then stops |
+| 1 | Triggered burst | A rising edge on TRIGIN (or `STRIG`) acquires `SNUMP` samples at `SSRATE`. The sum is held for `RSUM`, the average for `RADC`/`RCUR`, and the system re-arms automatically. Status: `GTRIGST`, `GTRIGCNT` (completed), `GTRIGMIS` (triggers missed during a burst) |
 | 2 | Continuous | DMA ping-pongs between two equal-size buffers; each fill is IIR-filtered |
 
 ---

@@ -348,6 +348,10 @@ static bool configure_dma_zerodma(uint32_t bufferA, uint32_t bufferB, int buffer
     // Allocate a DMA channel from the pool.
     if (myDMA.allocate() != DMA_STATUS_OK) return false;
 
+    // Note: descB is always allocated below, even when the first call is
+    // single-shot, so the application may later switch between single-shot
+    // (mode 1) and ping-pong (mode 2) without restarting.
+
     // Trigger the channel on every ADC result-ready event; transfer one beat per trigger.
     myDMA.setTrigger(ADC_DMAC_ID_RESRDY);
     myDMA.setAction(DMA_TRIGGER_ACTON_BEAT);
@@ -364,28 +368,24 @@ static bool configure_dma_zerodma(uint32_t bufferA, uint32_t bufferB, int buffer
     // Fire an interrupt (TCMPL) when this descriptor's block completes.
     descA->BTCTRL.bit.BLOCKACT = DMAC_BTCTRL_BLOCKACT_INT_Val;
 
-    if (bufferB != 0)
-    {
-        // Descriptor B: same setup for buffer B.
-        descB = myDMA.addDescriptor(
-            (void *)(&ADC->RESULT.reg),
-            (void *)bufferB,
-            bufferSize,
-            DMA_BEAT_SIZE_HWORD,
-            false,
-            true
-        );
-        descB->BTCTRL.bit.BLOCKACT = DMAC_BTCTRL_BLOCKACT_INT_Val;
+    // Descriptor B: same setup for buffer B.  In single-shot mode it is
+    // allocated but unused (it points at buffer A as a harmless placeholder).
+    descB = myDMA.addDescriptor(
+        (void *)(&ADC->RESULT.reg),
+        (void *)(bufferB != 0 ? bufferB : bufferA),
+        bufferSize,
+        DMA_BEAT_SIZE_HWORD,
+        false,
+        true
+    );
+    descB->BTCTRL.bit.BLOCKACT = DMAC_BTCTRL_BLOCKACT_INT_Val;
 
-        // Chain B back to A to create the ping-pong loop (A → B → A → …).
-        // ZeroDMA's addDescriptor already set descA->DESCADDR → descB.
-        descB->DESCADDR.reg = (uint32_t)descA;
-    }
-    else
-    {
-        // Single-shot: stop after buffer A is full.
-        descA->DESCADDR.reg = 0;
-    }
+    // Chain B back to A to create the ping-pong loop (A → B → A → …).
+    // ZeroDMA's addDescriptor already set descA->DESCADDR → descB.
+    descB->DESCADDR.reg = (uint32_t)descA;
+
+    // Single-shot: stop after buffer A is full.
+    if (bufferB == 0) descA->DESCADDR.reg = 0;
 
     myDMA.setCallback(dma_callback);
     return true;
@@ -448,6 +448,26 @@ void configure_dma(uint32_t bufferA, uint32_t bufferB, int bufferSize)
 void startDMA(void)
 {
 #if useZeroDma
+    myDMA.startJob();
+#else
+    DMAC->CHCTRLA.bit.ENABLE = 1;
+#endif
+}
+
+/** Start a single-shot DMA job aligned to a trigger event (ISR-safe).
+ *
+ *  The sample timer runs freely, so to make the trigger-to-first-sample delay
+ *  deterministic the TC4 counter is cleared; the first conversion then occurs
+ *  exactly one sample period after this call.  Any stale ADC result is
+ *  discarded first so it cannot be captured as sample 0.
+ *  (A conversion already in flight at the instant of the call can still land
+ *  in the buffer as the first sample.) */
+void startDMAtriggered(void)
+{
+#if useZeroDma
+    (void)ADC->RESULT.reg;                       // Flush stale result, clears RESRDY
+    TC4->COUNT32.COUNT.reg = 0;                  // Restart the sample period
+    while (TC4->COUNT32.STATUS.bit.SYNCBUSY);
     myDMA.startJob();
 #else
     DMAC->CHCTRLA.bit.ENABLE = 1;

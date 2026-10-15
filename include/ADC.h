@@ -82,6 +82,11 @@ int configureDMAADC(int gain, int freq, uint32_t bufferA, uint32_t bufferB, int 
 /** Start (or restart) the DMA transfer job. */
 void startDMA(void);
 
+/** Start a single-shot DMA job aligned to a trigger event (safe in an ISR).
+ *  Restarts the sample timer so the first sample is exactly one sample period
+ *  after the call, and discards any stale ADC result. */
+void startDMAtriggered(void);
+
 /** Abort any in-progress DMA transfer. */
 void stopDMA(void);
 

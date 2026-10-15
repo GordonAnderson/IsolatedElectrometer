@@ -12,7 +12,10 @@
 //
 // Operating modes:
 //   0 — Idle: single ADC reads on demand, no DMA
-//   1 — Vector acquire: DMA fills one buffer when triggered, then stops
+//   1 — Triggered burst: a rising edge on TRIGIN (or the STRIG command) acquires
+//       numberOfPoints samples at sampleRate.  The burst is summed and the sum
+//       (and derived average/current) is held until the next trigger.  The system
+//       re-arms automatically after each burst.
 //   2 — Continuous: DMA ping-pongs between two buffers; each fill is IIR-filtered
 //
 // Bias / polarity:
@@ -111,7 +114,17 @@ const char *Version = AppName ", version 1.0 Sept 9, 2025";
 uint16_t  *dataBuffer        = NULL;        ///< Single vector buffer (mode 1)
 uint16_t  *averageBuffers[2] = {NULL, NULL};///< Ping-pong buffers (mode 2)
 const char *status           = "Idle";
-bool       waitingForTrigger = false;       ///< True while mode-1 is armed
+
+// Mode-1 (triggered burst) state.  trigState is written from the TRIGIN ISR.
+#define TRIG_IDLE       0   ///< Not in mode 1, or not yet armed
+#define TRIG_ARMED      1   ///< Waiting for a trigger
+#define TRIG_ACQUIRING  2   ///< DMA is filling dataBuffer
+#define TRIG_PROCESSING 3   ///< Burst complete; loop() is summing it
+volatile int trigState   = TRIG_IDLE;
+volatile int trigMissed  = 0;   ///< Triggers ignored because a burst was in progress
+int          trigResults = 0;   ///< Completed bursts since mode 1 was entered
+int          trigSum     = 0;   ///< Sum of the last burst's 12-bit samples (max 4095 * 100000)
+bool         trigValid   = false;///< True once at least one burst has completed
 
 int   buffer0count = 0;  ///< Number of times buffer A has been filled (mode 2)
 int   buffer1count = 0;  ///< Number of times buffer B has been filled (mode 2)
@@ -160,6 +173,8 @@ bool  configure(void);
 void  setFilterFreq(float freq, float sampleRate);
 void  zero(void);
 void  applyBias(void);
+void  startAcquisition(void);
+bool  softTrigger(void);
 
 // =========================================================================
 // Serial command table
@@ -187,9 +202,15 @@ Command cmds[] =
     {"RADC",    CMDfunction,  0, (void *)ReportADC,            NULL,              "Report ADC counts"},
     {"RCUR",    CMDfunction,  0, (void *)ReportCurrent,        NULL,              "Report electrometer current in range units"},
     // Mode and trigger
-    {"SMODE",   CMDfunction,  1, (void *)SetMode,              NULL,              "Set the system mode, 0=idle 1=vector 2=continuous"},
+    {"SMODE",   CMDfunction,  1, (void *)SetMode,              NULL,              "Set the system mode, 0=idle 1=triggered 2=continuous"},
     {"GMODE",   CMDint,       0, (void *)&data.mode,           NULL,              "Report the system mode"},
     {"CONFIG",  CMDfunction,  0, (void *)Config,               NULL,              "Configure the system using current settings"},
+    // Triggered burst (mode 1)
+    {"STRIG",   CMDfunction,  0, (void *)SoftwareTrigger,      NULL,              "Software trigger, mode 1 only"},
+    {"GTRIGST", CMDfunction,  0, (void *)ReportTrigStatus,     NULL,              "Report trigger state, IDLE ARMED ACQUIRING PROCESSING"},
+    {"GTRIGCNT",CMDint,       0, (void *)&trigResults,         NULL,              "Report the number of completed triggered bursts"},
+    {"GTRIGMIS",CMDint,       0, (void *)&trigMissed,          NULL,              "Report the number of triggers missed during a burst"},
+    {"RSUM",    CMDint,       0, (void *)&trigSum,             NULL,              "Report the sum of the last triggered burst's samples"},
     // Sample rate
     {"SSRATE",  CMDint,       1, (void *)&data.sampleRate,     (void *)rngSrate,  "Set the ADC sample rate, 100 to 250000 Hz"},
     {"GSRATE",  CMDint,       0, (void *)&data.sampleRate,     NULL,              "Report the ADC sample rate"},
@@ -198,8 +219,8 @@ Command cmds[] =
     {"SANUMS",  CMDint,       1, (void *)&data.averageSamples, (void *)rngAnum,   "Set the number of average samples, 10 to 10000"},
     {"GANUMS",  CMDint,       0, (void *)&data.averageSamples, NULL,              "Report the number of average samples"},
     // Vector length
-    {"SNUMP",   CMDint,       1, (void *)&data.numberOfPoints, (void *)rngNpts,   "Set the number of points in acquire vector"},
-    {"GNUMP",   CMDint,       0, (void *)&data.numberOfPoints, NULL,              "Report the number of points in acquire vector"},
+    {"SNUMP",   CMDint,       1, (void *)&data.numberOfPoints, (void *)rngNpts,   "Set the number of points in a triggered burst"},
+    {"GNUMP",   CMDint,       0, (void *)&data.numberOfPoints, NULL,              "Report the number of points in a triggered burst"},
     // Filter
     {"SFILTER", CMDfloat,     1, (void *)&data.filter,         (void *)rngFilter, "Set the filter break frequency in Hz, 1 to 10000"},
     {"GFILTER", CMDfloat,     0, (void *)&data.filter,         NULL,              "Report the filter break frequency in Hz"},
@@ -240,11 +261,13 @@ void Debug(void)
     if (configure())
     {
         cp.println("Configured!");
-        startDMA();
-        delay(1000);
+        startAcquisition();
         if (data.mode == 1)
         {
-            if (!waitingForTrigger)
+            // Fire a software trigger and wait for the burst to finish.
+            softTrigger();
+            delay(1000);
+            if (trigState == TRIG_PROCESSING)
             {
                 cp.println("Data captured!");
                 cp.println(dataBuffer[0]);
@@ -255,6 +278,7 @@ void Debug(void)
         }
         else
         {
+            delay(1000);
             cp.print("Buffer 0 count: "); cp.println(buffer0count);
             cp.print("Buffer 1 count: "); cp.println(buffer1count);
         }
@@ -422,6 +446,17 @@ void receiveEvent(int howMany)
                 wh.SendByte((strcmp("nA", data.Range) == 0) ? 0 : 1);
                 break;
 
+            // ---- Triggered burst (mode 1) ----
+            case TWI_TRIGGER:
+                softTrigger();
+                break;
+            case TWI_READ_TRIGSTAT:
+                wh.SendByte(trigState);
+                break;
+            case TWI_READ_TRIGCNT:
+                wh.SendInt24(trigResults);
+                break;
+
             // ---- Full reconfigure ----
             case TWI_CONFIG:
                 requestConfig = true;
@@ -511,10 +546,60 @@ void setFilterFreq(float freq, float sampleRate)
 // DMA completion callbacks
 // =========================================================================
 
-/** Called by dmaCompleteCB when a single-buffer (mode 1) transfer finishes. */
+/** Called by dmaCompleteCB (ISR context) when the mode-1 burst finishes.
+ *  loop() does the summing so the ISR stays short. */
 void vectorAcquired(void)
 {
-    waitingForTrigger = false;
+    trigState = TRIG_PROCESSING;
+}
+
+/** Begin a mode-1 burst.  Safe to call from an ISR.
+ *  Ignored (and counted) if the system is not armed. */
+void acquireNow(void)
+{
+    if (trigState != TRIG_ARMED)
+    {
+        trigMissed++;
+        return;
+    }
+    trigState = TRIG_ACQUIRING;
+    startDMAtriggered();
+}
+
+/** TRIGIN rising-edge interrupt handler. */
+void triggerISR(void)
+{
+    acquireNow();
+}
+
+/** Arm the trigger: enable the TRIGIN interrupt and wait for an edge. */
+void armTrigger(void)
+{
+    trigState = TRIG_ARMED;
+    pinMode(TRIGIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(TRIGIN), triggerISR, RISING);
+}
+
+/** Start sampling for the current mode: arm the trigger in mode 1, start the
+ *  free-running DMA in mode 2, and do nothing in mode 0. */
+void startAcquisition(void)
+{
+    if (data.mode == 1) armTrigger();
+    else startAcquisition();
+}
+
+/** Sum a completed mode-1 burst, publish the result, and re-arm. */
+void processTriggeredBurst(void)
+{
+    uint32_t sum = 0;
+    for (int i = 0; i < data.numberOfPoints; i++) sum += dataBuffer[i];
+
+    trigSum   = (int)sum;
+    // Average of 12-bit samples, left-justified to 16 bits like modes 0 and 2.
+    ADCcounts = (int)(((uint64_t)sum * 16) / (uint32_t)data.numberOfPoints);
+    trigValid = true;
+    trigResults++;
+    trigState = TRIG_ARMED;   // Re-arm; the DMA job is restarted by the next trigger
 }
 
 /** Called by dmaBufferAcompleteCB when buffer A is full (mode 2 ping-pong). */
@@ -542,13 +627,19 @@ void buffer1complete(uint32_t buffer)
 /** Allocate buffers and configure DMA/ADC for the current data.mode.
  *
  *  Always stops any running DMA and frees existing buffers first.
- *  After a successful return, call startDMA() to begin transfers (modes 1 & 2).
+ *  After a successful return, call startAcquisition() to begin (mode 1 arms the
+ *  trigger; mode 2 starts the DMA).
  *
  *  @return true on success; false if malloc fails.
  */
 bool configure(void)
 {
-    // Halt any running DMA transfer.
+    // Disable the trigger interrupt and halt any running DMA transfer.
+    detachInterrupt(digitalPinToInterrupt(TRIGIN));
+    trigState = TRIG_IDLE;
+    trigValid = false;
+    trigResults = 0;
+    trigMissed  = 0;
     stopDMA();
 
     // Release previously allocated sample buffers.
@@ -569,7 +660,8 @@ bool configure(void)
     }
     else if (data.mode == 1)
     {
-        // Mode 1 — Vector acquire: fill one buffer on trigger, then stop.
+        // Mode 1 — Triggered burst: fill one buffer per trigger, then stop.
+        // The DMA job is started by the trigger (see armTrigger()).
         dataBuffer = (uint16_t *)malloc(data.numberOfPoints * sizeof(uint16_t));
         if (dataBuffer == NULL) return false;
 
@@ -577,7 +669,6 @@ bool configure(void)
         data.actualSampleRate = configureDMAADC(
             data.adcGain, data.sampleRate,
             (uint32_t)dataBuffer, 0, data.numberOfPoints);
-        waitingForTrigger = true;
     }
     else if (data.mode == 2)
     {
@@ -596,7 +687,6 @@ bool configure(void)
         data.actualSampleRate = configureDMAADC(
             data.adcGain, data.sampleRate,
             (uint32_t)averageBuffers[0], (uint32_t)averageBuffers[1], data.averageSamples);
-        waitingForTrigger = true;
     }
 
     return true;
@@ -656,7 +746,7 @@ void zero(void)
 
     data.mode = savedMode;
     configure();
-    if (data.mode != 0) startDMA();
+    startAcquisition();
 }
 
 // =========================================================================
@@ -706,7 +796,7 @@ void setup()
     // Apply bias and configure ADC/DMA for the stored mode.
     applyBias();
     configure();
-    if (data.mode != 0) startDMA();
+    startAcquisition();
 }
 
 // =========================================================================
@@ -726,7 +816,7 @@ void loop()
     {
         data.mode = requestMode;
         configure();
-        if (data.mode != 0) startDMA();
+        startAcquisition();
         requestMode = -1;
     }
     if (requestGain != -1)
@@ -748,13 +838,14 @@ void loop()
     if (requestConfig)
     {
         configure();
-        if (data.mode != 0) startDMA();
+        startAcquisition();
         requestConfig = false;
     }
 
     // Keep the global ADCcounts and current variables up to date.
     if (data.mode == 0) ADCcounts = analogRead(CUR) << 4;
     if (data.mode == 2) ADCcounts = filteredSum / (data.averageSamples / 16);
+    if (data.mode == 1 && trigState == TRIG_PROCESSING) processTriggeredBurst();
     current = calculateCurrent(ADCcounts);
 }
 
@@ -791,7 +882,7 @@ void SetGain(void)
 
 /** RADC — report the most recent ADC count value.
  *  Mode 0: perform a fresh single read (left-justified 16-bit).
- *  Mode 1: NAK — not available while a vector capture is armed.
+ *  Mode 1: the average of the last triggered burst (NAK until one completes).
  *  Mode 2: return the current filtered average.
  */
 void ReportADC(void)
@@ -803,7 +894,9 @@ void ReportADC(void)
     }
     else if (data.mode == 1)
     {
-        cp.sendNAK();
+        if (!trigValid) return cp.sendNAK();
+        cp.sendACK(false);
+        cp.println(ADCcounts);
     }
     else if (data.mode == 2)
     {
@@ -822,7 +915,9 @@ void ReportCurrent(void)
     }
     else if (data.mode == 1)
     {
-        cp.sendNAK();
+        if (!trigValid) return cp.sendNAK();
+        cp.sendACK(false);
+        cp.println(calculateCurrent(ADCcounts));
     }
     else if (data.mode == 2)
     {
@@ -836,15 +931,41 @@ void SetMode(void)
 {
     if (!cp.getValue(&data.mode, 0, 2)) return cp.sendNAK();
     if (!configure()) return cp.sendNAK();
-    if (data.mode != 0) startDMA();
+    startAcquisition();
     cp.sendACK();
+}
+
+/** Fire a software trigger without replying (also used from the TWI handler).
+ *  @return true if a burst was started. */
+bool softTrigger(void)
+{
+    noInterrupts();
+    bool ok = (data.mode == 1 && trigState == TRIG_ARMED);
+    if (ok) acquireNow();
+    interrupts();
+    return ok;
+}
+
+/** STRIG — fire a software trigger (mode 1); equivalent to a TRIGIN rising edge.
+ *  NAK if not in mode 1 or if a burst is already in progress. */
+void SoftwareTrigger(void)
+{
+    if (softTrigger()) cp.sendACK(); else cp.sendNAK();
+}
+
+/** GTRIGST — report the trigger state as text. */
+void ReportTrigStatus(void)
+{
+    static const char *names[] = {"IDLE", "ARMED", "ACQUIRING", "PROCESSING"};
+    cp.sendACK(false);
+    cp.println(names[trigState & 3]);
 }
 
 /** CONFIG — re-apply all current settings without changing data values. */
 void Config(void)
 {
     if (!configure()) return cp.sendNAK();
-    if (data.mode != 0) startDMA();
+    startAcquisition();
     cp.sendACK();
 }
 
