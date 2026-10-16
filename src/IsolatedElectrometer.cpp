@@ -90,7 +90,7 @@ Data Rev_1_data =
     100000,       // actualSampleRate — filled in by configureDMAADC()
     1,            // adcGain         — unity gain
     1000,         // averageSamples  — 1000 samples per IIR update
-    10000,        // numberOfPoints  — 10 000-point vector
+    1000,         // numberOfPoints  — 1000 points per triggered burst
     10,           // filter          — 10 Hz IIR break frequency
     3.3f,         // Bias            — 3.3 V (full-scale)
     1977,         // Calfactor       — ADC counts per nA at unit gain
@@ -121,6 +121,7 @@ const char *status           = "Idle";
 #define TRIG_ACQUIRING  2   ///< DMA is filling dataBuffer
 #define TRIG_PROCESSING 3   ///< Burst complete; loop() is summing it
 volatile int trigState   = TRIG_IDLE;
+bool         trigAttached= false;   ///< True while the TRIGIN interrupt is attached
 volatile int trigMissed  = 0;   ///< Triggers ignored because a burst was in progress
 int          trigResults = 0;   ///< Completed bursts since mode 1 was entered
 int          trigSum     = 0;   ///< Sum of the last burst's 12-bit samples (max 4095 * 100000)
@@ -161,7 +162,7 @@ debug            dbg(&cp);
 
 const int   rngSrate[2]  = {100, 250000};
 const int   rngAnum[2]   = {10, 10000};
-const int   rngNpts[2]   = {10, 100000};
+const int   rngNpts[2]   = {10, 5000};   // 2 bytes/point; limited by 32 KB RAM
 const float rngFilter[2] = {1, 10000};
 const char *rngPolarity  = "POS,NEG";
 const char *rngRange     = "nA,pA";
@@ -219,7 +220,7 @@ Command cmds[] =
     {"SANUMS",  CMDint,       1, (void *)&data.averageSamples, (void *)rngAnum,   "Set the number of average samples, 10 to 10000"},
     {"GANUMS",  CMDint,       0, (void *)&data.averageSamples, NULL,              "Report the number of average samples"},
     // Vector length
-    {"SNUMP",   CMDint,       1, (void *)&data.numberOfPoints, (void *)rngNpts,   "Set the number of points in a triggered burst"},
+    {"SNUMP",   CMDint,       1, (void *)&data.numberOfPoints, (void *)rngNpts,   "Set the number of points in a triggered burst, 10 to 5000"},
     {"GNUMP",   CMDint,       0, (void *)&data.numberOfPoints, NULL,              "Report the number of points in a triggered burst"},
     // Filter
     {"SFILTER", CMDfloat,     1, (void *)&data.filter,         (void *)rngFilter, "Set the filter break frequency in Hz, 1 to 10000"},
@@ -578,14 +579,18 @@ void armTrigger(void)
     trigState = TRIG_ARMED;
     pinMode(TRIGIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(TRIGIN), triggerISR, RISING);
+    // TRIGIN (PA08) is the NMI pin.  The Arduino core's attachInterrupt() sets up
+    // the NMI sense and callback but does not mux the pad to the EIC, so do it here.
+    pinPeripheral(TRIGIN, PIO_EXTINT);
+    trigAttached = true;
 }
 
 /** Start sampling for the current mode: arm the trigger in mode 1, start the
  *  free-running DMA in mode 2, and do nothing in mode 0. */
 void startAcquisition(void)
 {
-    if (data.mode == 1) armTrigger();
-    else startAcquisition();
+    if (data.mode == 1) { if (dataBuffer != NULL) armTrigger(); }
+    else if (data.mode == 2) { if (averageBuffers[1] != NULL) startDMA(); }
 }
 
 /** Sum a completed mode-1 burst, publish the result, and re-arm. */
@@ -630,12 +635,40 @@ void buffer1complete(uint32_t buffer)
  *  After a successful return, call startAcquisition() to begin (mode 1 arms the
  *  trigger; mode 2 starts the DMA).
  *
- *  @return true on success; false if malloc fails.
+ *  @return true on success; false if a buffer cannot be allocated safely.
  */
+/** Bytes kept free between the top of the heap and the stack. */
+#define STACK_RESERVE 4096
+
+/** malloc() that refuses allocations that would run into the stack.
+ *
+ *  The newlib _sbrk() in this core has no heap/stack collision check, so a
+ *  large malloc() can succeed while overlapping the stack; the DMA then
+ *  overwrites the stack when it fills the buffer.
+ */
+static void *safeMalloc(size_t bytes)
+{
+    void *p = malloc(bytes);
+    if (p == NULL) return NULL;
+    char stackMarker;   // its address approximates the current stack pointer
+    if ((char *)p + bytes + STACK_RESERVE > &stackMarker)
+    {
+        free(p);
+        return NULL;
+    }
+    return p;
+}
+
 bool configure(void)
 {
     // Disable the trigger interrupt and halt any running DMA transfer.
-    detachInterrupt(digitalPinToInterrupt(TRIGIN));
+    // Only touch the interrupt controller if we attached it (keeps the boot
+    // path in modes 0 and 2 free of any EIC access).
+    if (trigAttached)
+    {
+        detachInterrupt(digitalPinToInterrupt(TRIGIN));
+        trigAttached = false;
+    }
     trigState = TRIG_IDLE;
     trigValid = false;
     trigResults = 0;
@@ -662,7 +695,7 @@ bool configure(void)
     {
         // Mode 1 — Triggered burst: fill one buffer per trigger, then stop.
         // The DMA job is started by the trigger (see armTrigger()).
-        dataBuffer = (uint16_t *)malloc(data.numberOfPoints * sizeof(uint16_t));
+        dataBuffer = (uint16_t *)safeMalloc(data.numberOfPoints * sizeof(uint16_t));
         if (dataBuffer == NULL) return false;
 
         dmaCompleteCB = vectorAcquired;
@@ -673,10 +706,10 @@ bool configure(void)
     else if (data.mode == 2)
     {
         // Mode 2 — Continuous ping-pong: alternate between two equal-size buffers.
-        averageBuffers[0] = (uint16_t *)malloc(data.averageSamples * sizeof(uint16_t));
+        averageBuffers[0] = (uint16_t *)safeMalloc(data.averageSamples * sizeof(uint16_t));
         if (averageBuffers[0] == NULL) return false;
 
-        averageBuffers[1] = (uint16_t *)malloc(data.averageSamples * sizeof(uint16_t));
+        averageBuffers[1] = (uint16_t *)safeMalloc(data.averageSamples * sizeof(uint16_t));
         if (averageBuffers[1] == NULL) return false;
 
         dmaBufferAcompleteCB = buffer0complete;
