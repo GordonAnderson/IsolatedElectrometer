@@ -88,6 +88,9 @@ The following libraries must be available (configured via `lib_extra_dirs` in
 Connect at any baud rate (USB CDC — baud setting is ignored).
 Commands are ASCII strings terminated with `\n`.  Responses are prefixed
 with `ACK` (success) or `NAK` (failure or out-of-range argument).
+**Arguments are comma separated, not space separated: `SMODE,1`, `SNUMP,100`, `SSRATE,10000`.**
+(The tables below show the argument range in the second column.) A change to `SSRATE`, `SNUMP` and similar
+settings needs `CONFIG` to take effect while a mode is running.
 
 ### System
 
@@ -113,7 +116,7 @@ with `ACK` (success) or `NAK` (failure or out-of-range argument).
 
 | Command | Arguments | Description |
 |---------|-----------|-------------|
-| `SSRATE` | `100`–`250000` | Set ADC sample rate (Hz) |
+| `SSRATE` | `100`–`250000` | Set ADC sample rate (Hz). **Known bug: the real rate is currently one third of this**, see TODO.md |
 | `GSRATE` | — | Report requested sample rate |
 | `GSRATEA` | — | Report actual achieved sample rate |
 | `SANUMS` | `10`–`10000` | Set number of samples per averaging period (mode 2) |
