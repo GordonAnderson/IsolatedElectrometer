@@ -18,4 +18,4 @@
 - [ ] Mode 3, scope mode: a TRIGIN edge or a software start command fills the vector at `sampleRate`, with readback.
 - [ ] Selectable trigger edge (rising is fixed today). Needs a new `Data` field, which changes the flash layout; `triggerMode` is reserved.
 - [ ] Optional chunked ping-pong summing for mode 1 so `numberOfPoints` is not limited by RAM.
-- [ ] TWI read of the burst sum (sum can need 29 bits; `SendInt24` is too small).
+- [x] TWI read of the burst sum: `TWI_READ_TRIGDATA` (0x8B) returns count (24-bit) + sum (32-bit). Needs bench verification from the MIPS QUAD scan.

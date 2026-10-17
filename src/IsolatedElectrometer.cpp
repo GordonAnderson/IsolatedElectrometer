@@ -457,6 +457,18 @@ void receiveEvent(int howMany)
             case TWI_READ_TRIGCNT:
                 wh.SendInt24(trigResults);
                 break;
+            case TWI_READ_TRIGDATA:
+                // Count and sum in one transaction. processTriggeredBurst() publishes
+                // the sum before it increments the count, so a changed count always comes
+                // with the matching sum. The sum is up to 4095 * 5000, too big for
+                // SendInt24, so it is sent as two little endian words.
+                {
+                    int32_t sum = trigSum;
+                    wh.SendInt24(trigResults);
+                    wh.SendWord((int16_t)(sum & 0xFFFF));
+                    wh.SendWord((int16_t)((sum >> 16) & 0xFFFF));
+                }
+                break;
 
             // ---- Full reconfigure ----
             case TWI_CONFIG:

@@ -43,6 +43,7 @@
 #define TWI_READ_FILTER     0x88   ///< Read back filter frequency
 #define TWI_READ_TRIGSTAT   0x89   ///< Read trigger state (0=idle, 1=armed, 2=acquiring, 3=processing)
 #define TWI_READ_TRIGCNT    0x8A   ///< Read completed triggered results (24-bit)
+#define TWI_READ_TRIGDATA   0x8B   ///< Read completed count (24-bit) then the burst sum (32-bit), 7 bytes, little endian
 #define TWI_READ_ADC        0xA1   ///< Read latest raw ADC counts (16-bit, left-justified)
 #define TWI_READ_CUR        0xA2   ///< Read latest calibrated current (float)
 #endif

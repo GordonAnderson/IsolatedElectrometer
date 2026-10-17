@@ -162,6 +162,7 @@ read transaction to retrieve it.
 | `0x08` | `TWI_SET_FILTER` | Write (float) | Set filter break frequency |
 | `0x09` | `TWI_CONFIG` | Write | Re-apply settings |
 | `0x0A` | `TWI_ZERO` | Write | Auto-zero |
+| `0x0B` | `TWI_TRIGGER` | Write | Software trigger, same as a TRIGIN rising edge (mode 1) |
 | `0x27` | `TWI_SERIAL` | Write | Enter serial-talk mode (stream ASCII commands; ESC to exit) |
 | `0x7F` | `TWI_CMD` | Write + read | Send one ASCII command line; read response |
 | `0x82` | `TWI_READ_AVALIBLE` | Read (uint16) | Bytes available in output buffer |
@@ -171,6 +172,9 @@ read transaction to retrieve it.
 | `0x86` | `TWI_READ_RNG` | Read (int8) | Range |
 | `0x87` | `TWI_READ_BIAS` | Read (float) | Bias voltage |
 | `0x88` | `TWI_READ_FILTER` | Read (float) | Filter frequency |
+| `0x89` | `TWI_READ_TRIGSTAT` | Read (int8) | Trigger state, 0=idle 1=armed 2=acquiring 3=processing |
+| `0x8A` | `TWI_READ_TRIGCNT` | Read (24-bit) | Completed triggered bursts |
+| `0x8B` | `TWI_READ_TRIGDATA` | Read (7 bytes) | Completed burst count (24-bit) followed by the burst sum (32-bit), little endian. The sum is published before the count, so a changed count always carries its matching sum. Mode 1. |
 | `0xA1` | `TWI_READ_ADC` | Read (uint16) | Latest raw ADC counts |
 | `0xA2` | `TWI_READ_CUR` | Read (float) | Latest calibrated current |
 
