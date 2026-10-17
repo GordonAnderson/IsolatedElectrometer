@@ -147,13 +147,20 @@ void DMAC_Handler(void)
 // =========================================================================
 // configure_gclk
 // =========================================================================
-/** Set up GCLK4 as a 16 MHz generator (48 MHz DFLL ÷ 3) and route it to
+/** Set up GCLK4 as a 16 MHz generator (48 MHz DFLL ÷ GCLK4_DIV) and route it to
  *  the TC4/TC5 peripheral clock.  TC4 will use this as its count source.
  */
+// TC4 counts GCLK4, so the sample timer period must be computed from the GCLK4 frequency, TC4_CLOCK_HZ, and not from
+// F_CPU. It used F_CPU (48 MHz) while TC4 ran at 16 MHz, which made the real sample rate exactly one third of the
+// requested one (measured October 17, 2026) and made GSRATEA report the request. Keep these two definitions together:
+// the divider that makes the clock and the clock the timer arithmetic uses.
+#define GCLK4_DIV      3
+#define TC4_CLOCK_HZ   (48000000UL / GCLK4_DIV)
+
 void configure_gclk(void)
 {
-    // Divide the 48 MHz DFLL by 3 → 16 MHz on GCLK4.
-    GCLK->GENDIV.reg = GCLK_GENDIV_DIV(3) | GCLK_GENDIV_ID(4);
+    // Divide the 48 MHz DFLL by GCLK4_DIV → 16 MHz on GCLK4.
+    GCLK->GENDIV.reg = GCLK_GENDIV_DIV(GCLK4_DIV) | GCLK_GENDIV_ID(4);
     while (GCLK->STATUS.bit.SYNCBUSY);
 
     // Enable GCLK4, sourced from the DFLL48M.  IDC improves duty-cycle accuracy.
@@ -179,9 +186,9 @@ void configure_gclk(void)
  *  continuous event stream at the requested frequency.  The MCEO0 event output
  *  is enabled so that EVSYS can forward each match to the ADC.
  *
- *  The clock source is GCLK4 (16 MHz after configure_gclk()).  With F_CPU = 48
- *  MHz used as the reference for the CC value the prescaler is kept at DIV1
- *  (no division).
+ *  The clock source is GCLK4 (TC4_CLOCK_HZ, 16 MHz after configure_gclk()) and
+ *  the prescaler is kept at DIV1 (no division), so the CC value is
+ *  TC4_CLOCK_HZ / frequency.
  *
  *  @return Actual achieved frequency, which may differ from freq_hz due to
  *          integer truncation in the CC calculation.
@@ -193,12 +200,13 @@ int configure_timer_tc4(uint32_t freq_hz)
     // a write to be lost if the peripheral is still busy.
     TC4->COUNT32.CTRLA.reg = TC_CTRLA_MODE_COUNT32    // 32-bit counter width
                            | TC_CTRLA_WAVEGEN_MPWM    // Clears on CC[0] match
-                           | TC_CTRLA_PRESCALER_DIV1; // 1:1 prescaler (48 MHz)
+                           | TC_CTRLA_PRESCALER_DIV1; // 1:1 prescaler (TC4_CLOCK_HZ)
     while (TC4->COUNT32.STATUS.bit.SYNCBUSY);
 
     // Calculate the CC[0] compare value for the desired frequency.
     // cc_value = clock_freq / target_freq; timer resets at this count.
-    uint32_t cc_value = F_CPU / freq_hz;
+    uint32_t cc_value = TC4_CLOCK_HZ / freq_hz;
+    if (cc_value < 2) cc_value = 2;                 // Never ask for a period shorter than two counts
     TC4->COUNT32.CC[0].reg = cc_value;
     while (TC4->COUNT32.STATUS.bit.SYNCBUSY);
 
@@ -210,7 +218,7 @@ int configure_timer_tc4(uint32_t freq_hz)
     TC4->COUNT32.CTRLA.bit.ENABLE = 1;
     while (TC4->COUNT32.STATUS.bit.SYNCBUSY);
 
-    return F_CPU / cc_value;
+    return TC4_CLOCK_HZ / cc_value;
 }
 
 // =========================================================================
@@ -223,7 +231,11 @@ int configure_timer_tc4(uint32_t freq_hz)
  *    - Reference: INTVCC1 (0.5 × VDDANA ≈ 1.65 V)
  *    - Resolution: 12-bit
  *    - ADC clock prescaler: DIV64 (48 MHz / 64 = 750 kHz ADC clock)
- *      At 750 kHz and 14 cycles per 12-bit conversion → ~53 kSps maximum.
+ *      MEASURED October 17, 2026: this sustains 100 kS/s (about 7.5 ADC clock cycles per 12-bit conversion, 10 us),
+ *      not the 53 kS/s an earlier version of this comment claimed. A TC4 event that arrives while a conversion is
+ *      running is lost: with the timer at 120 to 200 kHz every other event was lost (burst takes 2x as long as
+ *      the rate says), at 250 kHz two of three (3x). The data stays correct, only the throughput drops, and
+ *      GSRATEA does not know about it. To sample faster raise the ADC clock (datasheet limit about 2.1 MHz).
  *      The actual sample rate is determined by the TC4 event frequency.
  *    - Conversion start: external event (TC4 via EVSYS)
  */

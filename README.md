@@ -116,7 +116,7 @@ settings needs `CONFIG` to take effect while a mode is running.
 
 | Command | Arguments | Description |
 |---------|-----------|-------------|
-| `SSRATE` | `100`–`250000` | Set ADC sample rate (Hz). **Known bug: the real rate is currently one third of this**, see TODO.md |
+| `SSRATE` | `100`–`250000` | Set ADC sample rate (Hz). **The ADC sustains 100 kHz at its current clock**; above that trigger events are lost and bursts take longer than the rate says (see TODO.md) |
 | `GSRATE` | — | Report requested sample rate |
 | `GSRATEA` | — | Report actual achieved sample rate |
 | `SANUMS` | `10`–`10000` | Set number of samples per averaging period (mode 2) |
