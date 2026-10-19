@@ -1,5 +1,15 @@
 # TODO
 
+## Count commands report the magnitude (October 18, 2026, commit 1fb1421)
+`RADC`, `RSUM`, TWI `0xA1` and the sum in TWI `0x8B` now report `abs(zeroCounts - counts)` (a burst sum: `abs(sum - n*zeroCounts/16)`);
+`RCUR` keeps the physical sign. Built, not flashed. This supersedes the older results below that compare `RADC` with
+`RSUM * 16 / SNUMP` (those were taken with raw counts).
+- [ ] Flash it, run `ZERO` in NEG and in POS with no input: `RADC`, `RSUM` and `RCUR` near 0.
+- [ ] 1 nA through 1 GOhm in both directions: `RCUR` is +1 for current into the input and -1 for current out, `RADC` is about 1876 either way.
+- [ ] `0x8B` and `0xA1` over TWI agree with `RSUM` and `RADC`.
+- [ ] The October 17 observation (dips in the raw sums with `RCUR` positive in NEG polarity) is unexplained; recheck after `ZERO`.
+- [ ] The factory `zeroCounts` (45000) matches neither polarity (NEG about 870, POS about 58900 at gain 1); consider a better default.
+
 ## Bench verification of mode 1 (triggered burst)
 - [x] `STRIG` software trigger: `GTRIGCNT` increments and `RSUM`/`RADC` report the burst (verified 2026-10-16).
 - [x] Serial bench run, October 17, 2026 (new firmware with `TWI_READ_TRIGDATA`, input A3 at 2.75 V): `RADC` equals `RSUM * 16 / SNUMP` exactly; the mean sample is steady to about 0.2 counts; 8 of 8 single triggers counted; 300 back-to-back `STRIG` gave 150 ACK, 150 NAK (refused while busy) and `GTRIGCNT` +150, every accepted trigger counted; a software `STRIG` refused while busy does **not** increment `GTRIGMIS` (only hardware edges do); a 5000 point sum of 17,058,115 at gain 1 and 20,475,000 (= 4095 * 5000, 25 bits) with the input saturated at gain 2 or more, so sums above 24 bits are produced and read correctly over serial; 60 s with TRIGIN floating and unconnected gave no spurious triggers.
