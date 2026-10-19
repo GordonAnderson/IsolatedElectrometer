@@ -19,9 +19,14 @@
 //   2 — Continuous: DMA ping-pongs between two buffers; each fill is IIR-filtered
 //
 // Bias / polarity:
-//   POS mode — current into the amplifier produces a positive ADC reading.
-//              Bias is set near full-scale and adjusted downward to zero.
-//   NEG mode — Bias is set to 0 V; zeroCounts captures the resting ADC value.
+//   The front end inverts: current flowing into the input (positive ions) LOWERS the raw ADC
+//   counts, current flowing out (negative ions) RAISES them. CUR ~ 0.90*Bias - 1.01*I*100M.
+//   POS mode — Bias is set near full scale (3.3/gain V) and adjusted down until the reading is
+//              below 65000 counts, so the baseline sits high and has room to fall.
+//   NEG mode — Bias is set to 0 V; zeroCounts captures the resting ADC value (near 0), so the
+//              baseline sits low and has room to rise.
+//   RCUR is signed (positive ions +, negative ions -). The count commands (RADC, RSUM, TWI
+//   0xA1, the sum in 0x8B) report the magnitude |zeroCounts - counts|, which rises with |I|.
 
 // ---- Feature selection ----
 #define AppName        "IsoElectrometer"
@@ -124,7 +129,8 @@ volatile int trigState   = TRIG_IDLE;
 bool         trigAttached= false;   ///< True while the TRIGIN interrupt is attached
 volatile int trigMissed  = 0;   ///< Triggers ignored because a burst was in progress
 int          trigResults = 0;   ///< Completed bursts since mode 1 was entered
-int          trigSum     = 0;   ///< Sum of the last burst's 12-bit samples (max 4095 * 100000)
+int          trigSum     = 0;   ///< Sum of the last burst's 12-bit samples (max 4095 * 100000), raw
+int          trigSumN    = 1;   ///< Number of samples in that sum (SNUMP when the burst ran)
 bool         trigValid   = false;///< True once at least one burst has completed
 
 int   buffer0count = 0;  ///< Number of times buffer A has been filled (mode 2)
@@ -200,7 +206,7 @@ Command cmds[] =
     {"LOADCAL", CMDfunction,  0, (void *)loadCalibrations,     NULL,              "Load current calibration from flash FS"},
 #endif
     // ADC / current measurement
-    {"RADC",    CMDfunction,  0, (void *)ReportADC,            NULL,              "Report ADC counts"},
+    {"RADC",    CMDfunction,  0, (void *)ReportADC,            NULL,              "Report signal counts, |counts - zeroCounts|"},
     {"RCUR",    CMDfunction,  0, (void *)ReportCurrent,        NULL,              "Report electrometer current in range units"},
     // Mode and trigger
     {"SMODE",   CMDfunction,  1, (void *)SetMode,              NULL,              "Set the system mode, 0=idle 1=triggered 2=continuous"},
@@ -211,7 +217,7 @@ Command cmds[] =
     {"GTRIGST", CMDfunction,  0, (void *)ReportTrigStatus,     NULL,              "Report trigger state, IDLE ARMED ACQUIRING PROCESSING"},
     {"GTRIGCNT",CMDint,       0, (void *)&trigResults,         NULL,              "Report the number of completed triggered bursts"},
     {"GTRIGMIS",CMDint,       0, (void *)&trigMissed,          NULL,              "Report the number of triggers missed during a burst"},
-    {"RSUM",    CMDint,       0, (void *)&trigSum,             NULL,              "Report the sum of the last triggered burst's samples"},
+    {"RSUM",    CMDfunction,  0, (void *)ReportSum,            NULL,              "Report the last burst's signal sum, |sum - n*zeroCounts/16|"},
     // Sample rate
     {"SSRATE",  CMDint,       1, (void *)&data.sampleRate,     (void *)rngSrate,  "Set the ADC sample rate, 100 to 250000 Hz"},
     {"GSRATE",  CMDint,       0, (void *)&data.sampleRate,     NULL,              "Report the ADC sample rate"},
@@ -398,7 +404,7 @@ void receiveEvent(int howMany)
 
             // ---- ADC / current readings ----
             case TWI_READ_ADC:
-                wh.SendWord(ADCcounts);
+                wh.SendWord(signalCounts(ADCcounts));
                 break;
             case TWI_READ_CUR:
                 wh.SendFloat(current);
@@ -463,7 +469,7 @@ void receiveEvent(int howMany)
                 // with the matching sum. The sum is up to 4095 * 5000, too big for
                 // SendInt24, so it is sent as two little endian words.
                 {
-                    int32_t sum = trigSum;
+                    int32_t sum = signalSum(trigSum, trigSumN);
                     wh.SendInt24(trigResults);
                     wh.SendWord((int16_t)(sum & 0xFFFF));
                     wh.SendWord((int16_t)((sum >> 16) & 0xFFFF));
@@ -505,6 +511,26 @@ void applyBias(void)
 // =========================================================================
 // Current calculation
 // =========================================================================
+
+/** Signal counts: the distance of a raw 16-bit left-justified reading from the ZERO baseline,
+ *  |zeroCounts - counts|. Always >= 0 and rises with the size of the current in either
+ *  polarity (a positive ion current lowers the raw counts, a negative one raises them).
+ *  The count commands (RADC, TWI 0xA1) report this, so the raw baseline offset and the
+ *  direction of the change do not matter to the reader. RCUR keeps the sign. */
+int signalCounts(int counts)
+{
+    int d = data.zeroCounts - counts;
+    return (d < 0) ? -d : d;
+}
+
+/** The same for a burst sum of n 12-bit samples: |sum - n * zeroCounts / 16|, in the units
+ *  of the sum (the zero is in 16-bit left-justified counts, a 12-bit sample is one sixteenth). */
+int32_t signalSum(int32_t sum, int n)
+{
+    int64_t d = (int64_t)sum * 16 - (int64_t)n * (int64_t)data.zeroCounts;
+    if (d < 0) d = -d;
+    return (int32_t)((d + 8) / 16);
+}
 
 /** Convert a raw 16-bit left-justified ADC count to a calibrated current.
  *
@@ -612,6 +638,7 @@ void processTriggeredBurst(void)
     for (int i = 0; i < data.numberOfPoints; i++) sum += dataBuffer[i];
 
     trigSum   = (int)sum;
+    trigSumN  = data.numberOfPoints;
     // Average of 12-bit samples, left-justified to 16 bits like modes 0 and 2.
     ADCcounts = (int)(((uint64_t)sum * 16) / (uint32_t)data.numberOfPoints);
     trigValid = true;
@@ -925,7 +952,7 @@ void SetGain(void)
     cp.sendACK();
 }
 
-/** RADC — report the most recent ADC count value.
+/** RADC — report the most recent signal count value, |counts - zeroCounts| (see signalCounts).
  *  Mode 0: perform a fresh single read (left-justified 16-bit).
  *  Mode 1: the average of the last triggered burst (NAK until one completes).
  *  Mode 2: return the current filtered average.
@@ -935,19 +962,27 @@ void ReportADC(void)
     if (data.mode == 0)
     {
         cp.sendACK(false);
-        cp.println(analogRead(CUR) << 4);
+        cp.println(signalCounts(analogRead(CUR) << 4));
     }
     else if (data.mode == 1)
     {
         if (!trigValid) return cp.sendNAK();
         cp.sendACK(false);
-        cp.println(ADCcounts);
+        cp.println(signalCounts(ADCcounts));
     }
     else if (data.mode == 2)
     {
         cp.sendACK(false);
-        cp.println(filteredSum / (data.averageSamples / 16));
+        cp.println(signalCounts(filteredSum / (data.averageSamples / 16)));
     }
+}
+
+/** RSUM — report the last triggered burst's signal sum, |sum - n*zeroCounts/16| (0 before the first burst). */
+void ReportSum(void)
+{
+    cp.sendACK(false);
+    int v = trigValid ? (int)signalSum(trigSum, trigSumN) : 0;
+    cp.println(v);
 }
 
 /** RCUR — report the calibrated electrometer current in the selected range units. */

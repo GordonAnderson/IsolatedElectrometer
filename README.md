@@ -47,7 +47,7 @@ GCLK4 (16 MHz)
 | Mode | Name | Description |
 |------|------|-------------|
 | 0 | Idle | Standard `analogRead()` on demand; no DMA running |
-| 1 | Triggered burst | A rising edge on TRIGIN (or `STRIG`) acquires `SNUMP` samples at `SSRATE`. The sum is held for `RSUM`, the average for `RADC`/`RCUR`, and the system re-arms automatically. Status: `GTRIGST`, `GTRIGCNT` (completed), `GTRIGMIS` (triggers missed during a burst) |
+| 1 | Triggered burst | A rising edge on TRIGIN (or `STRIG`) acquires `SNUMP` samples at `SSRATE`. The sum is held for `RSUM` (`abs(sum − SNUMP × zeroCounts / 16)`), the average for `RADC`/`RCUR`, and the system re-arms automatically. Status: `GTRIGST`, `GTRIGCNT` (completed), `GTRIGMIS` (triggers missed during a burst) |
 | 2 | Continuous | DMA ping-pongs between two equal-size buffers; each fill is IIR-filtered |
 
 ---
@@ -130,7 +130,7 @@ settings needs `CONFIG` to take effect while a mode is running.
 
 | Command | Arguments | Description |
 |---------|-----------|-------------|
-| `RADC` | — | Report raw ADC counts (16-bit, left-justified) |
+| `RADC` | — | Report signal counts, `abs(zeroCounts − counts)` (16-bit scale). Always ≥ 0 and rises with the size of the current in either polarity |
 | `RCUR` | — | Report calibrated current in selected range units |
 | `SGAIN` | `1`\|`2`\|`4`\|`8`\|`16`\|`32` | Set ADC gain |
 | `GGAIN` | — | Report ADC gain |
@@ -197,6 +197,13 @@ current (nA) = (zeroCounts − counts) / (Calfactor × adcGain)
 - **`zeroCounts`** — ADC counts corresponding to zero current; set by the `ZERO` command
 
 If the range is set to `pA` the result is multiplied by 1000.
+
+**Signs.** The front end inverts: current flowing into the input (positive ions landing on the collector) lowers the raw
+ADC counts, and current flowing out (negative ions) raises them. `RCUR` is signed by the formula above, so positive ions
+read positive and negative ions read negative, in both polarities. The count commands (`RADC`, `RSUM`, TWI `0xA1` and the
+sum in TWI `0x8B`) report the **magnitude** `abs(zeroCounts − counts)`, or `abs(sum − n × zeroCounts / 16)` for a burst
+sum (n = `SNUMP` when the burst ran), so they rise with the size of the current whichever way the raw counts move. Run
+`ZERO` first: the factory `zeroCounts` (45000) is only a placeholder.
 
 ### Zero procedure (`ZERO` command)
 

@@ -91,6 +91,9 @@ typedef struct
 void SetBias(void);
 void SetGain(void);
 void ReportADC(void);
+void ReportSum(void);
+int  signalCounts(int counts);
+int32_t signalSum(int32_t sum, int n);
 void ReportCurrent(void);
 void SetMode(void);
 void Config(void);
