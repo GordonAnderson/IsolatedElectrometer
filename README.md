@@ -137,6 +137,8 @@ settings needs `CONFIG` to take effect while a mode is running.
 | `SBIAS` | `0.0`–`3.3` | Set bias output voltage (V) |
 | `GBIAS` | — | Report bias voltage |
 | `ZERO` | — | Auto-zero: adjust bias to minimise resting current |
+| `SCLIP` | `0`\|`1` | `1` makes the count commands (`RADC`, `RSUM`, TWI `0xA1`, the sum in TWI `0x8B`) subtract the zero and report 0 for anything on the wrong side of it: `zeroCounts − counts` when the zero is high (≥ 32768), `counts − zeroCounts` when it is low. `0` (default) reports the magnitude. `RCUR` is unaffected |
+| `GCLIP` | — | Report count clipping |
 | `SPOL` | `POS`\|`NEG` | Set signal polarity |
 | `GPOL` | — | Report polarity |
 | `SRNG` | `nA`\|`pA` | Set measurement range |

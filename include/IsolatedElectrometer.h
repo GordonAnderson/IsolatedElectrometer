@@ -78,6 +78,7 @@ typedef struct
     int      zeroCounts;      ///< ADC counts corresponding to zero current
     char     Range[3];        ///< Measurement range: "nA" or "pA"
     char     Polarity[4];     ///< Signal polarity: "POS" or "NEG"
+    int      clipNegative;    ///< 1 = count commands subtract the zero and clip values on the wrong side of it to 0
 
     // --- DAC calibration ---
     DACchan  BiasDAC;         ///< Calibration for the bias DAC channel (Chan, m, b)

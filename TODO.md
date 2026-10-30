@@ -9,6 +9,7 @@
 - [ ] `0x8B` and `0xA1` over TWI agree with `RSUM` and `RADC`.
 - [ ] The October 17 observation (dips in the raw sums with `RCUR` positive in NEG polarity) is unexplained; recheck after `ZERO`.
 - [ ] The factory `zeroCounts` (45000) matches neither polarity (NEG about 870, POS about 58900 at gain 1); consider a better default.
+- [ ] `SCLIP 1` (count clipping, new, only builds so far): after `ZERO` in NEG (low zero), `RADC` and `RSUM` read 0 for a current of the wrong sign and the counts above the zero for the right one; in POS (high zero) the reverse. `RCUR` is unchanged. `SCLIP 0` gives the magnitude again, `0xA1` and `0x8B` over TWI follow the setting, and `SAVE`/`RESTORE` keep it. The first boot after flashing loads the defaults (the `Data` layout changed), so redo `ZERO`.
 
 ## Bench verification of mode 1 (triggered burst)
 - [x] `STRIG` software trigger: `GTRIGCNT` increments and `RSUM`/`RADC` report the burst (verified 2026-10-16).

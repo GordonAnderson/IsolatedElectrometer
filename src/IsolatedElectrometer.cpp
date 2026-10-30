@@ -27,8 +27,11 @@
 //              baseline sits low and has room to rise.
 //   RCUR is signed (positive ions +, negative ions -). The count commands (RADC, RSUM, TWI
 //   0xA1, the sum in 0x8B) report the magnitude |zeroCounts - counts|, which rises with |I|.
+//   SCLIP 1 instead subtracts the zero and reports 0 for anything on the wrong side of it:
+//   zeroCounts - counts when the zero is high (>= midscale), counts - zeroCounts when it is low.
 
 // ---- Feature selection ----
+#define ZERO_MIDSCALE  32768   ///< zeroCounts at or above this is a "high" zero (signal falls)
 #define AppName        "IsoElectrometer"
 #define UseWireClient  true
 #define UseThreads     true
@@ -102,6 +105,7 @@ Data Rev_1_data =
     45000,        // zeroCounts      — resting counts in NEG mode
     "nA",         // Range
     "NEG",        // Polarity
+    0,            // clipNegative    — count commands report the magnitude
     { 0, 310, 0 },// BiasDAC         — channel 0, 310 counts/V, 0 offset
     SIGNATURE
 };
@@ -170,6 +174,7 @@ const int   rngSrate[2]  = {100, 250000};
 const int   rngAnum[2]   = {10, 10000};
 const int   rngNpts[2]   = {10, 5000};   // 2 bytes/point; limited by 32 KB RAM
 const float rngFilter[2] = {1, 10000};
+const int   rngClip[2]   = {0, 1};
 const char *rngPolarity  = "POS,NEG";
 const char *rngRange     = "nA,pA";
 
@@ -244,6 +249,9 @@ Command cmds[] =
     {"GPOL",    CMDstr,       0, (void *)&data.Polarity,       NULL,              "Report polarity"},
     {"SRNG",    CMDstr,       1, (void *)&data.Range,          (void *)rngRange,  "Set range, nA or pA"},
     {"GRNG",    CMDstr,       0, (void *)&data.Range,          NULL,              "Report range"},
+    // Count clipping
+    {"SCLIP",   CMDint,       1, (void *)&data.clipNegative,   (void *)rngClip,   "Set count clipping, 1 = zero-subtracted counts with the wrong side of the zero reported as 0, 0 = magnitude"},
+    {"GCLIP",   CMDint,       0, (void *)&data.clipNegative,   NULL,              "Report count clipping"},
     // Calibration (read-only via '?' prefix)
     {"?CALF",   CMDfloat,    -1, (void *)&data.Calfactor,      NULL,              "Calibration factor in counts per nA"},
     {NULL}
@@ -512,23 +520,36 @@ void applyBias(void)
 // Current calculation
 // =========================================================================
 
-/** Signal counts: the distance of a raw 16-bit left-justified reading from the ZERO baseline,
- *  |zeroCounts - counts|. Always >= 0 and rises with the size of the current in either
- *  polarity (a positive ion current lowers the raw counts, a negative one raises them).
- *  The count commands (RADC, TWI 0xA1) report this, so the raw baseline offset and the
- *  direction of the change do not matter to the reader. RCUR keeps the sign. */
+/** Signal counts: the distance of a raw 16-bit left-justified reading from the ZERO baseline.
+ *  Default (clipNegative = 0): the magnitude |zeroCounts - counts|, always >= 0 and rising
+ *  with the size of the current in either polarity.
+ *  clipNegative = 1: the zero is subtracted and anything on the wrong side of it reads 0.
+ *  A zero set high (>= midscale) has room to fall, so the signal is zeroCounts - counts and
+ *  readings above the zero are 0; a zero set low has room to rise, so the signal is
+ *  counts - zeroCounts and readings below the zero are 0.
+ *  The count commands (RADC, TWI 0xA1) report this. RCUR keeps the sign. */
 int signalCounts(int counts)
 {
     int d = data.zeroCounts - counts;
+    if (data.clipNegative)
+    {
+        if (data.zeroCounts < ZERO_MIDSCALE) d = -d;
+        return (d < 0) ? 0 : d;
+    }
     return (d < 0) ? -d : d;
 }
 
-/** The same for a burst sum of n 12-bit samples: |sum - n * zeroCounts / 16|, in the units
- *  of the sum (the zero is in 16-bit left-justified counts, a 12-bit sample is one sixteenth). */
+/** The same for a burst sum of n 12-bit samples, in the units of the sum (the zero is in
+ *  16-bit left-justified counts, a 12-bit sample is one sixteenth). */
 int32_t signalSum(int32_t sum, int n)
 {
     int64_t d = (int64_t)sum * 16 - (int64_t)n * (int64_t)data.zeroCounts;
-    if (d < 0) d = -d;
+    if (data.clipNegative)
+    {
+        if (data.zeroCounts < ZERO_MIDSCALE) d = -d;
+        if (d < 0) d = 0;
+    }
+    else if (d < 0) d = -d;
     return (int32_t)((d + 8) / 16);
 }
 
