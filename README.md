@@ -137,7 +137,9 @@ settings needs `CONFIG` to take effect while a mode is running.
 | `SBIAS` | `0.0`–`3.3` | Set bias output voltage (V) |
 | `GBIAS` | — | Report bias voltage |
 | `ZERO` | — | Auto-zero: adjust bias to minimise resting current |
-| `SCLIP` | `0`\|`1` | `1` makes the count commands (`RADC`, `RSUM`, TWI `0xA1`, the sum in TWI `0x8B`) subtract the zero and report 0 for anything on the wrong side of it: `zeroCounts − counts` when the zero is high (≥ 32768), `counts − zeroCounts` when it is low. `0` (default) reports the magnitude. `RCUR` is unaffected |
+| `SZERO` | `0`–`65535` | Set `zeroCounts` (16-bit left-justified ADC counts) |
+| `GZERO` | — | Report `zeroCounts` |
+| `SCLIP` | `0`\|`1` | `1` makes the count commands (`RADC`, `RSUM`, TWI `0xA1`, the sum in TWI `0x8B`) subtract the zero and report 0 for anything on the wrong side of it, the side set by the polarity: `counts − zeroCounts` in `NEG`, `zeroCounts − counts` in `POS`. `0` (default) reports the magnitude. `RCUR` is unaffected |
 | `GCLIP` | — | Report count clipping |
 | `SPOL` | `POS`\|`NEG` | Set signal polarity |
 | `GPOL` | — | Report polarity |
@@ -168,6 +170,7 @@ read transaction to retrieve it.
 | `0x09` | `TWI_CONFIG` | Write | Re-apply settings |
 | `0x0A` | `TWI_ZERO` | Write | Auto-zero |
 | `0x0B` | `TWI_TRIGGER` | Write | Software trigger, same as a TRIGIN rising edge (mode 1) |
+| `0x0C` | `TWI_SET_ZERO` | Write (uint16) | Set `zeroCounts` |
 | `0x27` | `TWI_SERIAL` | Write | Enter serial-talk mode (stream ASCII commands; ESC to exit) |
 | `0x7F` | `TWI_CMD` | Write + read | Send one ASCII command line; read response |
 | `0x82` | `TWI_READ_AVALIBLE` | Read (uint16) | Bytes available in output buffer |
@@ -180,6 +183,7 @@ read transaction to retrieve it.
 | `0x89` | `TWI_READ_TRIGSTAT` | Read (int8) | Trigger state, 0=idle 1=armed 2=acquiring 3=processing |
 | `0x8A` | `TWI_READ_TRIGCNT` | Read (24-bit) | Completed triggered bursts |
 | `0x8B` | `TWI_READ_TRIGDATA` | Read (7 bytes) | Completed burst count (24-bit) followed by the burst sum (32-bit), little endian. The sum is published before the count, so a changed count always carries its matching sum. Mode 1. |
+| `0x8C` | `TWI_READ_ZERO` | Read (uint16) | `zeroCounts` |
 | `0xA1` | `TWI_READ_ADC` | Read (uint16) | Latest raw ADC counts |
 | `0xA2` | `TWI_READ_CUR` | Read (float) | Latest calibrated current |
 
@@ -196,7 +200,7 @@ current (nA) = (zeroCounts − counts) / (Calfactor × adcGain)
 ```
 
 - **`Calfactor`** — ADC counts per nA at unit gain (factory default: 1977 counts/nA)
-- **`zeroCounts`** — ADC counts corresponding to zero current; set by the `ZERO` command
+- **`zeroCounts`** — ADC counts corresponding to zero current; set by the `ZERO` command, or directly with `SZERO`
 
 If the range is set to `pA` the result is multiplied by 1000.
 
@@ -212,6 +216,9 @@ sum (n = `SNUMP` when the burst ran), so they rise with the size of the current 
 - **NEG polarity** — sets Bias to 0 V and records the resting ADC value as `zeroCounts`
 - **POS polarity** — starts Bias at `3.3 / adcGain` V and steps it down until the
   reading falls below 65000 counts, then records that value as `zeroCounts`
+- The bias is set using `analogRead()`, but in modes 1 and 2 the recorded zero is the average of software bursts
+  (at least 1000 samples at `SSRATE`), the same DMA path `RSUM` uses: the two paths do not agree (NEG, gain 1:
+  `analogRead()` about 4200, bursts about 1180). In mode 0 the `analogRead()` value is kept. `SZERO` overrides it.
 
 ### DAC calibration (`BiasDAC`)
 

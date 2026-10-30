@@ -27,11 +27,11 @@
 //              baseline sits low and has room to rise.
 //   RCUR is signed (positive ions +, negative ions -). The count commands (RADC, RSUM, TWI
 //   0xA1, the sum in 0x8B) report the magnitude |zeroCounts - counts|, which rises with |I|.
-//   SCLIP 1 instead subtracts the zero and reports 0 for anything on the wrong side of it:
-//   zeroCounts - counts when the zero is high (>= midscale), counts - zeroCounts when it is low.
+//   SCLIP 1 instead subtracts the zero and reports 0 for anything on the wrong side of it, the
+//   side set by the polarity: counts - zeroCounts in NEG, zeroCounts - counts in POS.
+//   SZERO / GZERO write and read zeroCounts directly.
 
 // ---- Feature selection ----
-#define ZERO_MIDSCALE  32768   ///< zeroCounts at or above this is a "high" zero (signal falls)
 #define AppName        "IsoElectrometer"
 #define UseWireClient  true
 #define UseThreads     true
@@ -175,6 +175,7 @@ const int   rngAnum[2]   = {10, 10000};
 const int   rngNpts[2]   = {10, 5000};   // 2 bytes/point; limited by 32 KB RAM
 const float rngFilter[2] = {1, 10000};
 const int   rngClip[2]   = {0, 1};
+const int   rngZero[2]   = {0, 65535};
 const char *rngPolarity  = "POS,NEG";
 const char *rngRange     = "nA,pA";
 
@@ -244,6 +245,8 @@ Command cmds[] =
     {"GGAIN",   CMDint,       0, (void *)&data.adcGain,        NULL,              "Report ADC gain"},
     // Zero
     {"ZERO",    CMDfunction,  0, (void *)zeroCurrent,          NULL,              "Zero the electrometer output"},
+    {"SZERO",   CMDint,       1, (void *)&data.zeroCounts,     (void *)rngZero,   "Set the zero, 16-bit left-justified ADC counts, 0 to 65535"},
+    {"GZERO",   CMDint,       0, (void *)&data.zeroCounts,     NULL,              "Report the zero, 16-bit left-justified ADC counts"},
     // Polarity and range
     {"SPOL",    CMDstr,       1, (void *)&data.Polarity,       (void *)rngPolarity,"Set polarity, POS or NEG"},
     {"GPOL",    CMDstr,       0, (void *)&data.Polarity,       NULL,              "Report polarity"},
@@ -438,6 +441,15 @@ void receiveEvent(int howMany)
             case TWI_ZERO:
                 requestZero = true;
                 break;
+            case TWI_SET_ZERO:
+                {
+                    int16_t z;
+                    if (wh.Read16bitInt(&z)) data.zeroCounts = (uint16_t)z;
+                }
+                break;
+            case TWI_READ_ZERO:
+                wh.SendWord(data.zeroCounts);
+                break;
 
             // ---- Polarity ----
             case TWI_SET_POL:   // 0 = POS, 1 = NEG
@@ -524,16 +536,16 @@ void applyBias(void)
  *  Default (clipNegative = 0): the magnitude |zeroCounts - counts|, always >= 0 and rising
  *  with the size of the current in either polarity.
  *  clipNegative = 1: the zero is subtracted and anything on the wrong side of it reads 0.
- *  A zero set high (>= midscale) has room to fall, so the signal is zeroCounts - counts and
- *  readings above the zero are 0; a zero set low has room to rise, so the signal is
- *  counts - zeroCounts and readings below the zero are 0.
+ *  The polarity picks the side: negative ions raise the counts, so in NEG the signal is
+ *  counts - zeroCounts and readings below the zero are 0; positive ions lower them, so in
+ *  POS the signal is zeroCounts - counts and readings above the zero are 0.
  *  The count commands (RADC, TWI 0xA1) report this. RCUR keeps the sign. */
 int signalCounts(int counts)
 {
     int d = data.zeroCounts - counts;
     if (data.clipNegative)
     {
-        if (data.zeroCounts < ZERO_MIDSCALE) d = -d;
+        if (strcmp("NEG", data.Polarity) == 0) d = -d;
         return (d < 0) ? 0 : d;
     }
     return (d < 0) ? -d : d;
@@ -543,10 +555,11 @@ int signalCounts(int counts)
  *  16-bit left-justified counts, a 12-bit sample is one sixteenth). */
 int32_t signalSum(int32_t sum, int n)
 {
-    int64_t d = (int64_t)sum * 16 - (int64_t)n * (int64_t)data.zeroCounts;
+    // Same sign as signalCounts (zero - counts) so the polarity flip picks the same side.
+    int64_t d = (int64_t)n * (int64_t)data.zeroCounts - (int64_t)sum * 16;
     if (data.clipNegative)
     {
-        if (data.zeroCounts < ZERO_MIDSCALE) d = -d;
+        if (strcmp("NEG", data.Polarity) == 0) d = -d;
         if (d < 0) d = 0;
     }
     else if (d < 0) d = -d;
@@ -796,15 +809,46 @@ void zeroCurrent(void)
     cp.sendACK();
 }
 
+/** Average the ADC through the mode-1 burst DMA path (the path RSUM and mode 2 use),
+ *  16-bit left-justified. Fires software bursts of numberOfPoints at sampleRate until at
+ *  least minSamples are summed. Leaves data.mode at 1; the caller restores it.
+ *  @return The average, or -1 if a burst did not complete. */
+int readBurstAverage(int minSamples)
+{
+    data.mode = 1;
+    if (!configure()) return -1;
+
+    int rate = (data.actualSampleRate > 0) ? data.actualSampleRate : data.sampleRate;
+    uint32_t timeout = (uint32_t)((uint64_t)data.numberOfPoints * 1000 / rate) + 100;
+    uint64_t sum = 0;
+    int n = 0;
+    while (n < minSamples)
+    {
+        trigState = TRIG_ARMED;
+        acquireNow();
+        uint32_t start = millis();
+        while (trigState != TRIG_PROCESSING && millis() - start < timeout);
+        if (trigState != TRIG_PROCESSING) break;
+        for (int i = 0; i < data.numberOfPoints; i++) sum += dataBuffer[i];
+        n += data.numberOfPoints;
+    }
+    trigState = TRIG_IDLE;
+    if (n == 0) return -1;
+    return (int)((sum * 16) / (uint64_t)n);
+}
+
 /** Adjust the bias voltage to minimise the resting ADC reading, then record
  *  the resulting counts as zeroCounts.
  *
- *  The system is temporarily put into mode 0 (idle / Arduino analogRead) while
- *  the zero procedure runs, then restored to the previous mode.
+ *  The bias is set in mode 0 (idle / Arduino analogRead). The zero is then read through
+ *  the path the selected mode measures with: analogRead in mode 0, a set of software
+ *  bursts in modes 1 and 2. The two paths do not agree (in NEG at gain 1 analogRead read
+ *  about 4200 where the bursts rested at about 1180), so a zero taken with analogRead is
+ *  wrong for RSUM. The previous mode is restored at the end.
  *
  *  NEG mode: Bias = 0 V; zeroCounts is whatever the ADC reads with no current.
- *  POS mode: Bias is stepped down from (3.3 / gain) V until the reading is
- *            below 65000 counts, then that value is recorded as zeroCounts.
+ *  POS mode: Bias is stepped down from (3.3 / gain) V until the analogRead value is
+ *            below 65000 counts, then the reading is recorded as zeroCounts.
  */
 void zero(void)
 {
@@ -812,12 +856,13 @@ void zero(void)
     data.mode = 0;
     configure();
 
+    int counts;
     if (strcmp("NEG", data.Polarity) == 0)
     {
         data.Bias = 0;
         applyBias();
         delay(10);
-        data.zeroCounts = readAnalog(1000);
+        counts = readAnalog(1000);
     }
     else
     {
@@ -825,7 +870,7 @@ void zero(void)
         data.Bias = 3.3f / (float)data.adcGain;
         applyBias();
         delay(5);
-        int counts = readAnalog(1000);
+        counts = readAnalog(1000);
         while (counts > 65000)
         {
             if (data.Bias <= 0.0f) break;
@@ -834,8 +879,13 @@ void zero(void)
             delay(5);
             counts = readAnalog(1000);
         }
-        data.zeroCounts = counts;
     }
+    if (savedMode != 0)
+    {
+        int burst = readBurstAverage(1000);
+        if (burst >= 0) counts = burst;
+    }
+    data.zeroCounts = counts;
 
     data.mode = savedMode;
     configure();

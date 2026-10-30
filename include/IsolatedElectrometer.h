@@ -32,6 +32,7 @@
 #define TWI_CONFIG          0x09   ///< Re-apply current settings
 #define TWI_ZERO            0x0A   ///< Zero the electrometer output
 #define TWI_TRIGGER         0x0B   ///< Software trigger (mode 1, same as a TRIGIN rising edge)
+#define TWI_SET_ZERO        0x0C   ///< Set zeroCounts (uint16, 16-bit left-justified counts)
 #define TWI_SERIAL          0x27   ///< Enter TWI serial-talk mode (streams commands)
 #define TWI_CMD             0x7F   ///< Send one ASCII command line; read response
 #define TWI_READ_AVALIBLE   0x82   ///< Request: how many bytes are in the output buffer?
@@ -44,6 +45,7 @@
 #define TWI_READ_TRIGSTAT   0x89   ///< Read trigger state (0=idle, 1=armed, 2=acquiring, 3=processing)
 #define TWI_READ_TRIGCNT    0x8A   ///< Read completed triggered results (24-bit)
 #define TWI_READ_TRIGDATA   0x8B   ///< Read completed count (24-bit) then the burst sum (32-bit), 7 bytes, little endian
+#define TWI_READ_ZERO       0x8C   ///< Read back zeroCounts (uint16)
 #define TWI_READ_ADC        0xA1   ///< Read latest raw ADC counts (16-bit, left-justified)
 #define TWI_READ_CUR        0xA2   ///< Read latest calibrated current (float)
 #endif
