@@ -101,6 +101,8 @@ void SetNumPoints(void);
 void ReportZeroStatus(void);
 void SetAvgSamples(void);
 void SetSampleRate(void);
+void SetPolarity(void);
+void SetRange(void);
 void ReportADC(void);
 void ReportSum(void);
 int  signalCounts(int counts);

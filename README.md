@@ -93,8 +93,8 @@ with `ACK` (success) or `NAK` (failure or out-of-range argument).
 the buffers and DMA are rebuilt by the main loop right after the reply, so `CONFIG` is no longer needed (in mode 1 the
 held burst result is cleared by the rebuild, so `RADC` NAKs until the next trigger). They reply NAK, and change nothing,
 if the value is out of range or its buffers would not fit the static sample pool. If a rebuild still fails, the last working settings
-are restored and `GCFGERR` counts it. Settings read from flash at boot (and `RESTORE`) are range checked as a whole;
-an invalid image is replaced by the defaults (boot) or refused with NAK (`RESTORE`). I2C setters (mode, gain, bias,
+are restored and `GCFGERR` counts it. Settings read from flash at boot (and `RESTORE`) are range checked field by field;
+a bad field gets its factory default and everything else (zero, calibration, address) is kept. I2C setters (mode, gain, bias,
 filter) ignore out-of-range values.
 
 ### System
@@ -106,7 +106,7 @@ filter) ignore out-of-range values.
 | `SAVE` | — | Write current settings to internal flash |
 | `RESTORE` | — | Reload settings from internal flash |
 | `BLOAD` | — | Jump to UF2 bootloader (presents USB mass-storage) |
-| `STWIADD` | `<hex>` | Set I²C client address |
+| `STWIADD` | hex `08`–`77` | Set the I2C client address; takes effect after `SAVE` and a reset |
 | `GTWIADD` | — | Report I²C client address (hex) |
 
 ### Mode and configuration
@@ -148,9 +148,9 @@ filter) ignore out-of-range values.
 | `GZEROST` | — | Report the last `ZERO`: `NEVER`, `BUSY`, `OK` or `FAILED` (poll this after a `ZERO` over TWI) |
 | `SCLIP` | `0`\|`1` | `1` makes the count commands (`RADC`, `RSUM`, TWI `0xA1`, the sum in TWI `0x8B`) subtract the zero and report 0 for anything on the wrong side of it, the side set by the polarity: `counts − zeroCounts` in `NEG`, `zeroCounts − counts` in `POS`. `0` (default) reports the magnitude. `RCUR` is unaffected |
 | `GCLIP` | — | Report count clipping |
-| `SPOL` | `POS`\|`NEG` | Set signal polarity |
+| `SPOL` | `POS`\|`NEG` | Set signal polarity (whole word, any case) |
 | `GPOL` | — | Report polarity |
-| `SRNG` | `nA`\|`pA` | Set measurement range |
+| `SRNG` | `nA`\|`pA` | Set range (whole word, any case) |
 | `GRNG` | — | Report range |
 | `?CALF` | — | Report calibration factor (counts/nA at unit gain) |
 
@@ -227,7 +227,11 @@ sum (n = `SNUMP` when the burst ran), so they rise with the size of the current 
   and 2 the average of software bursts (at least 1000 samples at `SSRATE`, 200 per search step), the same DMA path
   `RSUM` uses; in mode 0 `analogRead()`. The two paths do not agree (NEG, gain 1: `analogRead()` about 4200, bursts
   about 1180). `SZERO` overrides the result.
-- `ZERO` replies ACK when it finishes, or NAK (leaving `zeroCounts` and the bias unchanged) if a reading failed. It
+- The zero depends on the sample rate (on a clean source: 755 counts at 100 kS/s, 737 at 1 kS/s, 630 at 100 S/s),
+  so run `ZERO` again after changing `SSRATE` (and after changing the gain or the bias).
+- `ZERO` replies ACK when it finishes, or NAK (leaving `zeroCounts` and the bias unchanged) if a reading failed (in POS
+  also when the input stays above 65000 counts even at 0 V bias). Its bursts are at most 20 ms long, so it takes well
+  under a second at 100 kS/s and about 0.4 s even at 100 S/s. It
   reconfigures once, keeps the last burst result (`GTRIGCNT`, `RADC`, `RSUM` do not reset) and misses hardware triggers
   while it runs (NEG: well under a second; POS: seconds, depending on the bias search).
 - Over TWI, `ZERO` sent with `TWI_CMD` **replies ACK at once** and runs from the main loop (it takes a fraction of a second

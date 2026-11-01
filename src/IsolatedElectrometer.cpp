@@ -32,6 +32,19 @@
 //   SZERO / GZERO write and read zeroCounts directly.
 //
 // Revision history:
+//   1.2  October 31, 2026 (review fixes)
+//     - loop() clears each request flag before acting on it (a ZERO arriving at the end of the
+//       previous one could leave GZEROST stuck at BUSY); the flags are volatile.
+//     - TWI_CMD: no 100 us wait per byte inside the I2C interrupt; a line without a newline is
+//       completed; a line that arrives while loop() is running a command is handed to loop()
+//       instead of re-entering the command processor (one line deep, a second gets NAK).
+//     - ZERO: bias never below 0 V, FAILED if the input stays saturated at 0 V; bursts at most
+//       20 ms and about 0.2 s of samples at low rates (was up to 50 s per burst).
+//     - Settings from flash/RESTORE are repaired field by field (bad field -> default, the zero,
+//       calibration and address are kept) instead of being discarded as a whole.
+//     - SPOL / SRNG accept whole words only (were any part of "POS,NEG" / "nA,pA").
+//     - STWIADD stores the address (08..77 hex; was parsed and thrown away), used after SAVE
+//       and a reset.
 //   1.1  October 31, 2026
 //     - ZERO: one reconfigure, baseline read from software bursts in modes 1 and 2 (the idle
 //       analogRead path sits thousands of counts away on the real front end), the last burst result
@@ -141,7 +154,7 @@ Data Rev_1_data =
 // Note: the storage area is erased each time the sketch is uploaded.
 FlashStorage(flash_data, Data);
 
-const char *Version = AppName ", version 1.1 Oct 31, 2026";
+const char *Version = AppName ", version 1.2 Oct 31, 2026";
 
 // =========================================================================
 // Application state
@@ -184,6 +197,10 @@ volatile bool filterPrimed = false; ///< False until the first mode-2 buffer see
 int   dataPoints   = 0;  ///< Samples in dataBuffer (mode 1), 0 when not allocated
 int   avgSamples   = 0;  ///< Samples in each averageBuffers[] (mode 2), 0 when not allocated
 
+// When > 0, configure() builds the mode 1 buffer with this many points instead of
+// data.numberOfPoints (zero() uses it to keep its bursts short; see zeroBurstLength()).
+int   burstPointsOverride = 0;
+
 // Last configuration that configure() accepted, restored if a pending change cannot be applied.
 int   goodPoints   = 0;
 int   goodSamples  = 0;
@@ -192,11 +209,20 @@ int   configErrors = 0;  ///< Configurations rejected since boot (GCFGERR)
 
 // TWI deferred-action flags — set in receiveEvent() (ISR context), acted on
 // in loop() (main-loop context) to keep the ISR short.
-int  requestMode   = -1;    ///< Pending mode change (-1 = none)
-int  requestGain   = -1;    ///< Pending gain change (-1 = none)
-bool requestBias   = false; ///< Pending bias update
-bool requestZero   = false; ///< Pending zero operation
-bool requestConfig = false; ///< Pending full reconfiguration
+// Each flag is cleared by loop() before it acts on it, so a request that arrives while
+// the previous one is being handled is kept, not wiped.
+volatile int  requestMode   = -1;    ///< Pending mode change (-1 = none)
+volatile int  requestGain   = -1;    ///< Pending gain change (-1 = none)
+volatile bool requestBias   = false; ///< Pending bias update
+volatile bool requestZero   = false; ///< Pending zero operation
+volatile bool requestConfig = false; ///< Pending full reconfiguration
+
+// TWI_CMD lines that loop() must run: SMODE/CONFIG/SAVE always, any line that arrives while
+// loop() is itself inside cp.processCommands() (the command processor's parse buffers and
+// scratch memory are shared and not reentrant). One line deep; a second one is refused (NAK).
+volatile bool cpInUse        = false; ///< loop() is inside cp.processCommands()
+volatile bool twiLinePending = false; ///< twiLine holds a line for loop()
+char          twiLine[102];           ///< The pending line, newline terminated
 
 // Latest ADC measurement, updated every loop() iteration.
 int   ADCcounts = 0;   ///< Raw ADC value, 16-bit left-justified
@@ -224,8 +250,6 @@ const int   rngNpts[2]   = {10, 5000};   // 2 bytes/point; limited by 32 KB RAM
 const float rngFilter[2] = {1, 10000};
 const int   rngClip[2]   = {0, 1};
 const int   rngZero[2]   = {0, 65535};
-const char *rngPolarity  = "POS,NEG";
-const char *rngRange     = "nA,pA";
 
 /** True for the six legal ADC gains. */
 static bool validGain(int g)
@@ -242,7 +266,7 @@ bool  zero(void);
 void  applyBias(void);
 void  startAcquisition(void);
 bool  applyMode(int mode);
-static bool settingsValid(const Data &d);
+static int   sanitizeSettings(Data &d);
 bool  softTrigger(void);
 
 // =========================================================================
@@ -258,7 +282,7 @@ Command cmds[] =
     {"RESTORE", CMDfunction,  0, (void *)RestoreSettings,      NULL,              "Restore system settings"},
     {"BLOAD",   CMDfunction,  0, (void *)bootloader,           NULL,              "Jump to bootloader"},
 #if UseWireClient
-    {"STWIADD", CMDfunction,  1, (void *)setTWIaddress,        NULL,              "Set TWI address, hex"},
+    {"STWIADD", CMDfunction,  1, (void *)setTWIaddress,        NULL,              "Set TWI address, hex 08 to 77; takes effect after SAVE and a reset"},
     {"GTWIADD", CMDfunction,  0, (void *)getTWIaddress,        NULL,              "Returns the TWI address, hex"},
 #endif
 #if UseSPIflash
@@ -306,9 +330,9 @@ Command cmds[] =
     {"SZERO",   CMDint,       1, (void *)&data.zeroCounts,     (void *)rngZero,   "Set the zero, 16-bit left-justified ADC counts, 0 to 65535"},
     {"GZERO",   CMDint,       0, (void *)&data.zeroCounts,     NULL,              "Report the zero, 16-bit left-justified ADC counts"},
     // Polarity and range
-    {"SPOL",    CMDstr,       1, (void *)&data.Polarity,       (void *)rngPolarity,"Set polarity, POS or NEG"},
+    {"SPOL",    CMDfunction,  1, (void *)SetPolarity,          NULL,              "Set polarity, POS or NEG"},
     {"GPOL",    CMDstr,       0, (void *)&data.Polarity,       NULL,              "Report polarity"},
-    {"SRNG",    CMDstr,       1, (void *)&data.Range,          (void *)rngRange,  "Set range, nA or pA"},
+    {"SRNG",    CMDfunction,  1, (void *)SetRange,             NULL,              "Set range, nA or pA"},
     {"GRNG",    CMDstr,       0, (void *)&data.Range,          NULL,              "Report range"},
     // Count clipping
     {"SCLIP",   CMDint,       1, (void *)&data.clipNegative,   (void *)rngClip,   "Set count clipping, 1 = zero-subtracted counts with the wrong side of the zero reported as 0, 0 = magnitude"},
@@ -427,7 +451,6 @@ static bool runsInLoop(const char *line)
 void receiveEvent(int howMany)
 {
     uint8_t     cmd;
-    int         i;
     int8_t      b;
     static bool TWITALKmode = false;
 
@@ -461,29 +484,27 @@ void receiveEvent(int howMany)
 
             case TWI_CMD:
                 // Receive one ASCII command line and buffer the response for the next master
-                // read.
+                // read. The whole message is already in the Wire buffer when this runs.
                 //  - ZERO takes a fraction of a second or more and the MIPS will not wait for
                 //    it, so it is only requested here: ACK at once, loop() runs it, and the
                 //    caller asks GZEROST whether it has finished. (NAK if one is already running.)
                 //  - SMODE, CONFIG and SAVE reconfigure the hardware or write flash, which is
                 //    unsafe inside the I2C interrupt (the DMA interrupt cannot run until it
-                //    returns): the line is queued and loop() runs it; the reply is staged when
-                //    it finishes.
+                //    returns): the line is handed to loop() and the reply is staged when it
+                //    finishes. Any line that arrives while loop() is running a command is handed
+                //    over the same way. Only one line can wait; another one gets NAK.
                 //  - Everything else runs here and replies at once.
                 {
-                    char line[101];
+                    char line[102];
                     int  len = 0;
                     wh.sb.clear();
-                    for (i = 0; i < 100; i++)
+                    while (Wire.available() != 0 && len < 100)
                     {
-                        if (Wire.available() != 0)
-                        {
-                            cmd = Wire.read();
-                            if (len < 100) line[len++] = (char)cmd;
-                            if (cmd == '\n') break;
-                        }
-                        delayMicroseconds(100);
+                        cmd = Wire.read();
+                        line[len++] = (char)cmd;
+                        if (cmd == '\n') break;
                     }
+                    if (len == 0 || line[len - 1] != '\n') line[len++] = '\n';   // A line without a newline would never complete
                     line[len] = 0;
                     cp.selectStream(&wh.sb);
                     if (isExactCommand(line, "ZERO"))
@@ -496,10 +517,19 @@ void receiveEvent(int howMany)
                             cp.sendACK();
                         }
                     }
+                    else if (runsInLoop(line) || cpInUse)
+                    {
+                        if (twiLinePending) cp.sendNAK();
+                        else
+                        {
+                            memcpy(twiLine, line, len + 1);
+                            twiLinePending = true;
+                        }
+                    }
                     else
                     {
                         for (int k = 0; k < len; k++) cp.rb->put(line[k]);
-                        if (!runsInLoop(line)) cp.processCommands();
+                        cp.processCommands();
                     }
                 }
                 break;
@@ -944,20 +974,21 @@ bool configure(void)
     {
         // Mode 1 — Triggered burst: fill one buffer per trigger, then stop.
         // The DMA job is started by the trigger (see armTrigger()).
-        if (!buffersFit(1, data.numberOfPoints, 0)) return false;
+        int points = (burstPointsOverride > 0) ? burstPointsOverride : data.numberOfPoints;
+        if (!buffersFit(1, points, 0)) return false;
         dataBuffer = samplePool;
 
         dmaCompleteCB = vectorAcquired;
         rate = configureDMAADC(
             data.adcGain, data.sampleRate,
-            (uint32_t)dataBuffer, 0, data.numberOfPoints);
+            (uint32_t)dataBuffer, 0, points);
         if (rate < 0)
         {
             dataBuffer = NULL;
             dmaCompleteCB = NULL;
             return false;
         }
-        dataPoints = data.numberOfPoints;
+        dataPoints = points;
     }
     else if (data.mode == 2)
     {
@@ -1028,6 +1059,11 @@ int readBurstAverage(int minSamples)
 
     int rate = (data.actualSampleRate > 0) ? data.actualSampleRate : data.sampleRate;
     uint32_t timeout = (uint32_t)((uint64_t)dataPoints * 1000 / rate) + 100;
+    // At low sample rates do not ask for more than about 0.2 s of samples (at least one burst),
+    // so a ZERO, and each step of the POS bias search, stays short.
+    int cap = rate / 5;
+    if (cap < dataPoints) cap = dataPoints;
+    if (minSamples > cap) minSamples = cap;
     uint64_t sum = 0;
     int n = 0;
     while (n < minSamples)
@@ -1047,6 +1083,17 @@ int readBurstAverage(int minSamples)
     trigState = TRIG_IDLE;
     if (n == 0) return -1;
     return (int)((sum * 16) / (uint64_t)n);
+}
+
+/** Points per burst for zero(): the burst length the user measures with (SNUMP), so the
+ *  first-sample effects weigh the same, but never longer than 20 ms at the current sample
+ *  rate (at least 10 points). SNUMP 5000 at a low SSRATE would otherwise make one burst
+ *  take up to 50 s. */
+static int zeroBurstLength(void)
+{
+    int maxPoints = data.sampleRate / 50;
+    if (maxPoints < rngNpts[0]) maxPoints = rngNpts[0];
+    return (data.numberOfPoints < maxPoints) ? data.numberOfPoints : maxPoints;
 }
 
 /** One baseline reading in the current data.mode: analogRead() in mode 0, software bursts
@@ -1078,15 +1125,17 @@ void zeroCurrent(void)
  *  NEG at gain 1 analogRead read about 4200 where the bursts rested at about 1180), so a
  *  zero taken with analogRead is wrong for RSUM.
  *
- *  Reconfigures once: into mode 1 (or mode 0) for the measurement, which is also the
- *  final configuration for those modes; only mode 2 needs a second configure() to get its
- *  own buffers back. The last burst result (trigValid, trigResults, trigMissed, trigSum,
+ *  Reconfigures into mode 1 (or mode 0) for the measurement. Bursts are SNUMP points but at
+ *  most 20 ms long (zeroBurstLength), and at low sample rates the average is capped at about
+ *  0.2 s of samples, so ZERO stays short. Mode 2, and mode 1 when the zero used shorter
+ *  bursts, are configured once more at the end. The last burst result (trigValid, trigResults, trigMissed, trigSum,
  *  ADCcounts) is kept, so RADC and GTRIGCNT survive a ZERO. Hardware triggers are not seen
  *  while it runs. Runs from loop() only (see runsInLoop).
  *
  *  NEG mode: Bias = 0 V; zeroCounts is whatever the ADC reads with no current.
  *  POS mode: Bias is stepped down from (3.3 / gain) V until the reading is below 65000
- *            counts, then that reading is recorded as zeroCounts.
+ *            counts, then that reading is recorded as zeroCounts. FAILED if even 0 V bias
+ *            leaves the input above 65000; the bias never goes below 0.
  *
  *  @return true if zeroCounts was updated; false if a reading failed, in which case
  *          zeroCounts and Bias are left as they were. */
@@ -1104,8 +1153,9 @@ bool zero(void)
     zeroing = true;
     zeroStatus = ZERO_BUSY;
     data.mode = (savedMode == 0) ? 0 : 1;
+    if (data.mode == 1) burstPointsOverride = zeroBurstLength();
     bool ok = configure();
-    if (ok) requestConfig = false;   // This configure() already applied any pending setting
+    burstPointsOverride = 0;
     int counts = -1;
 
     if (ok)
@@ -1124,14 +1174,15 @@ bool zero(void)
             applyBias();
             delay(5);
             counts = readBaseline(ZERO_SEARCH_SAMPLES);
-            while (counts > 65000)
+            while (counts > 65000 && data.Bias > 0.0f)
             {
-                if (data.Bias <= 0.0f) break;
                 data.Bias -= 0.01f;
+                if (data.Bias < 0.0f) data.Bias = 0.0f;   // Never store a negative bias (an invalid setting)
                 applyBias();
                 delay(5);
                 counts = readBaseline(ZERO_SEARCH_SAMPLES);
             }
+            if (counts > 65000) counts = -1;               // Saturated even at 0 V bias: no usable zero
             if (counts >= 0) counts = readBaseline(ZERO_SAMPLES);
         }
     }
@@ -1144,7 +1195,11 @@ bool zero(void)
     }
 
     data.mode = savedMode;
-    if (savedMode == 2) ok = configure() && ok;   // mode 2 needs its own buffers and DMA setup
+    // Mode 2 needs its own buffers and DMA setup; mode 1 needs its own burst length back if
+    // the zero used shorter bursts. This configure() also applies any setting that changed
+    // while the zero ran.
+    if (savedMode == 2 || (savedMode == 1 && dataPoints != data.numberOfPoints)) ok = configure() && ok;
+    if (ok) requestConfig = false;
     startAcquisition();                           // re-arms mode 1, restarts mode 2
 
     trigValid   = savedValid;
@@ -1173,7 +1228,8 @@ void setup()
     // Load persisted configuration; fall back to factory defaults if the
     // flash has never been written or the signature is invalid.
     data = flash_data.read();
-    if (data.Signature != SIGNATURE || !settingsValid(data)) data = Rev_1_data;
+    if (data.Signature != SIGNATURE) data = Rev_1_data;
+    else sanitizeSettings(data);   // Out-of-range fields get their defaults; the rest is kept
 
     // Initialise the USB serial host interface.
     Serial.begin(0);
@@ -1216,7 +1272,18 @@ void setup()
 void loop()
 {
     cp.processStreams();
+#if UseWireClient
+    if (twiLinePending)
+    {
+        // A TWI_CMD line handed over by the I2C handler: run it here, reply to the I2C buffer.
+        for (char *c = twiLine; *c; c++) cp.rb->put(*c);
+        cp.selectStream(&wh.sb);
+        twiLinePending = false;
+    }
+#endif
+    cpInUse = true;
     cp.processCommands();
+    cpInUse = false;
 
 #if UseThreads
     control.run();
@@ -1232,19 +1299,20 @@ void loop()
     }
     if (requestGain != -1)
     {
-        data.adcGain = requestGain;
-        applyGain(requestGain);
+        int g = requestGain;
         requestGain = -1;
+        data.adcGain = g;
+        applyGain(g);
     }
     if (requestBias)
     {
-        applyBias();
         requestBias = false;
+        applyBias();
     }
     if (requestZero)
     {
-        zero();
         requestZero = false;
+        zero();
     }
     if (requestConfig)
     {
@@ -1376,6 +1444,29 @@ void SetMode(void)
     cp.sendACK();
 }
 
+/** SPOL — set the polarity, POS or NEG (any case). Whole words only: the library's string
+ *  setter accepted any part of "POS,NEG" (EG, P, ...), which then read as POS. */
+void SetPolarity(void)
+{
+    char *v;
+    if (!cp.getValue(&v)) return cp.sendNAK();
+    if      (strcasecmp(v, "POS") == 0) strcpy(data.Polarity, "POS");
+    else if (strcasecmp(v, "NEG") == 0) strcpy(data.Polarity, "NEG");
+    else return cp.sendNAK();
+    cp.sendACK();
+}
+
+/** SRNG — set the range, nA or pA (any case). Whole words only, see SetPolarity. */
+void SetRange(void)
+{
+    char *v;
+    if (!cp.getValue(&v)) return cp.sendNAK();
+    if      (strcasecmp(v, "nA") == 0) strcpy(data.Range, "nA");
+    else if (strcasecmp(v, "pA") == 0) strcpy(data.Range, "pA");
+    else return cp.sendNAK();
+    cp.sendACK();
+}
+
 /** SNUMP — set the number of points in a triggered burst. Refused (NAK) if the buffer
  *  does not fit the sample pool. The buffer is rebuilt by loop(), which also works when this
  *  runs inside the I2C handler; a mode 1 burst result is cleared when that happens. */
@@ -1449,27 +1540,34 @@ void Config(void)
 // Settings validation
 // =========================================================================
 
-/** True if every field of a configuration is inside the range its command accepts. Applied
- *  to what is read from flash at boot and by RESTORE, so a corrupt or stale image can never
- *  put an out-of-range size, mode or gain into use. */
-static bool settingsValid(const Data &d)
+/** Bring a configuration read from flash (boot, RESTORE) inside the ranges its commands
+ *  accept, field by field: a bad field gets its factory default and the rest (zero,
+ *  calibration, bias DAC, address) is kept. An image written by a different layout of Data
+ *  (Size differs) cannot be read field by field, so it is replaced as a whole.
+ *  @return The number of fields replaced, or -1 if the whole image was replaced. */
+static int sanitizeSettings(Data &d)
 {
-    if (d.mode < 0 || d.mode > 2) return false;
-    if (d.sampleRate < rngSrate[0] || d.sampleRate > rngSrate[1]) return false;
-    if (d.averageSamples < rngAnum[0] || d.averageSamples > rngAnum[1]) return false;
-    if (d.numberOfPoints < rngNpts[0] || d.numberOfPoints > rngNpts[1]) return false;
-    if (!validGain(d.adcGain)) return false;
-    if (!(d.filter >= rngFilter[0] && d.filter <= rngFilter[1])) return false;   // false for NaN
-    if (!(d.Bias >= 0.0f && d.Bias <= 3.3f)) return false;
-    if (!(d.Calfactor > 0.0f && d.Calfactor < 1.0e9f)) return false;
-    if (d.zeroCounts < 0 || d.zeroCounts > 65535) return false;
-    if (d.clipNegative != 0 && d.clipNegative != 1) return false;
-    if (strncmp(d.Polarity, "POS", 4) != 0 && strncmp(d.Polarity, "NEG", 4) != 0) return false;
-    if (strncmp(d.Range, "nA", 3) != 0 && strncmp(d.Range, "pA", 3) != 0) return false;
+    const Data &f = Rev_1_data;
+    if (d.Size != (int16_t)sizeof(Data)) { d = f; return -1; }
+    int n = 0;
+    if (d.mode < 0 || d.mode > 2)                                           { d.mode = f.mode; n++; }
+    if (d.sampleRate < rngSrate[0] || d.sampleRate > rngSrate[1])           { d.sampleRate = f.sampleRate; n++; }
+    if (d.averageSamples < rngAnum[0] || d.averageSamples > rngAnum[1])     { d.averageSamples = f.averageSamples; n++; }
+    if (d.numberOfPoints < rngNpts[0] || d.numberOfPoints > rngNpts[1])     { d.numberOfPoints = f.numberOfPoints; n++; }
+    if (!validGain(d.adcGain))                                              { d.adcGain = f.adcGain; n++; }
+    if (!(d.filter >= rngFilter[0] && d.filter <= rngFilter[1]))            { d.filter = f.filter; n++; }   // false for NaN
+    if (!(d.Bias >= 0.0f && d.Bias <= 3.3f))                                { d.Bias = f.Bias; n++; }
+    if (!(d.Calfactor > 0.0f && d.Calfactor < 1.0e9f))                      { d.Calfactor = f.Calfactor; n++; }
+    if (d.zeroCounts < 0 || d.zeroCounts > 65535)                           { d.zeroCounts = f.zeroCounts; n++; }
+    if (d.clipNegative != 0 && d.clipNegative != 1)                         { d.clipNegative = f.clipNegative; n++; }
+    if (strncmp(d.Polarity, "POS", 4) != 0 && strncmp(d.Polarity, "NEG", 4) != 0) { strcpy(d.Polarity, f.Polarity); n++; }
+    if (strncmp(d.Range, "nA", 3) != 0 && strncmp(d.Range, "pA", 3) != 0)   { strcpy(d.Range, f.Range); n++; }
+    if (!(d.BiasDAC.m > 0.0f && d.BiasDAC.m < 1.0e5f) ||
+        !(d.BiasDAC.b > -1.0e5f && d.BiasDAC.b < 1.0e5f))                   { d.BiasDAC = f.BiasDAC; n++; }
 #if UseWireClient
-    if (d.TWIadd < 8 || d.TWIadd > 119) return false;
+    if (d.TWIadd < 8 || d.TWIadd > 119)                                     { d.TWIadd = f.TWIadd; n++; }
 #endif
-    return true;
+    return n;
 }
 
 // =========================================================================
@@ -1494,10 +1592,10 @@ void RestoreSettings(void)
         cp.sendNAK();
         return;
     }
-    // Refuse an image that is out of range or whose buffers would not fit, and keep the
-    // running settings. Otherwise the buffers, bias and ADC are rebuilt by loop() (this can
-    // run in the I2C handler).
-    if (!settingsValid(td) || !buffersFit(1, td.numberOfPoints, 0) || !buffersFit(2, 0, td.averageSamples))
+    // Out-of-range fields get their defaults (so the buffers always fit); NAK only if the
+    // image is from a different layout of Data and nothing could be kept. The buffers, bias
+    // and ADC are rebuilt by loop() (this can run in the I2C handler).
+    if (sanitizeSettings(td) < 0)
     {
         cp.sendNAK();
         return;
@@ -1635,8 +1733,9 @@ void bootloader(void)
 void setTWIaddress(void)
 {
     int i;
-    if (cp.getValue(&i, 0, 255, HEX)) return cp.sendACK();
-    else cp.sendNAK();
+    if (!cp.getValue(&i, 8, 119, HEX)) return cp.sendNAK();   // 7-bit addresses outside the reserved ranges
+    data.TWIadd = i;                                          // Used by Wire.begin() at the next boot: SAVE, then reset
+    cp.sendACK();
 }
 
 /** GTWIADD — report the current TWI client address in hex. */

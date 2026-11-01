@@ -1,5 +1,20 @@
 # TODO
 
+## Firmware 1.2 (October 31, 2026, code review fixes; QT Py tested over USB, not on the electrometer)
+Request flags cleared before use (GZEROST could stick at BUSY); TWI_CMD without per-byte delays and without re-entering
+the command processor while loop() runs one; ZERO bias clamp, FAILED on saturation, bounded duration; settings repaired
+field by field; SPOL/SRNG whole words; STWIADD stores the address. Open from the review (need the real front end first):
+- [ ] Mode 0 readings depend on history: after mode 1 or 2 the ADC keeps DIV64 / SAMPCTRL 0 and TC4 keeps starting
+  conversions, unlike the core's settings after boot. Restore the Arduino ADC setup and stop TC4 when entering mode 0.
+- [ ] Burst path sample time (SAMPCTRL 0) may be too short for the front end's output impedance (idle and burst agree
+  within 10 to 34 counts on a clean source, differ by about 3000 on the electrometer). Measure; a longer SAMPCTRL needs
+  a faster ADC clock to keep 100 kS/s.
+- [ ] The zero depends on SSRATE (QT Py, clean source: 755 / 737 / 630 at 100000 / 1000 / 100 S/s). Explain.
+- [ ] Mode 1 re-arms only from loop(): measure the shortest trigger spacing that is reliably counted.
+- [ ] GTRIGCNT resets on SNUMP/SSRATE/SMODE/CONFIG; check the MIPS does not assume it only rises.
+- [ ] stopDMA() does not clear a pending transfer-complete interrupt; SAVE stalls the CPU for a few ms (a trigger
+  during it starts late); mode 2 IIR has a small dead band at small SANUMS and low filter frequencies.
+
 ## Bench checklist for the October 31, 2026 firmware
 Everything from the ZERO / TWI_CMD rework and the fix list (SNUMP default 100, deferred TWI_CMD commands, one-pass
 `zero()`, reconfigure on setting change, settings validation, mode 2 scaling, trigger arming, DMA failure handling) is

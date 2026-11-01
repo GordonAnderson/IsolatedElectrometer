@@ -1,4 +1,4 @@
-# Bench checklist: IsolatedElectrometer firmware of October 31, 2026
+# Bench checklist: IsolatedElectrometer firmware 1.2 (October 31, 2026)
 
 **For the Claude session on the bench machine.** Read this whole file first, then walk the user through the tests
 one at a time. Rules:
@@ -112,7 +112,7 @@ Mark each: `[ ] PASS  [ ] FAIL  [ ] SKIP`.
 
 ### T1. Boot with the defaults (USB)
 Send `GVER`, `GMODE`, `GNUMP`, `GANUMS`, `GSRATE`, `GCFGERR`, `GZERO`.
-Expect: replies for all; `GMODE` 2, `GNUMP` **100**, `GANUMS` 1000, `GSRATE` 100000, `GCFGERR` 0, `GZERO` 45000.
+Expect: `GVER` says **version 1.2**; replies for all; `GMODE` 2, `GNUMP` **100**, `GANUMS` 1000, `GSRATE` 100000, `GCFGERR` 0, `GZERO` 45000.
 Result:
 
 ### T2. Enter mode 1 and arm
@@ -322,6 +322,12 @@ read about 25300 counts whatever `SBIAS` was, so it was floating), no I2C master
   - T18 soak, 100 s over USB: 384 `STRIG` (298 ACK, 86 NAK because a burst was still running or the state was not armed:
     expected with `SSRATE` 1000 and `SNUMP` 5000 in the mix), 33 random `ZERO` / `SNUMP` / `SSRATE` / `SMODE,2` / `CONFIG`
     events, no missing reply, no hang or reset, `GCFGERR` 0, `GTRIGMIS` 0.
+- Firmware 1.2 (review fixes), QT Py over USB, all PASS: `SPOL,EG` and `SPOL,P` NAK, `SPOL,neg` sets NEG;
+  `SRNG,A` NAK, `SRNG,pa` sets pA; `STWIADD,7` and `,78` NAK, `STWIADD,21` stored (`GTWIADD` 21). `ZERO` time is
+  bounded: 0.21 s at 100 kS/s (SNUMP 100 and 5000), 0.38 s at 1 kS/s and at 100 S/s with SNUMP 5000 (was up to 50 s
+  per burst), POS at 100 S/s 1.02 s; `GNUMP` and triggering are back to normal afterwards. The zero depends on the
+  rate: 755 / 737 / 630 counts at 100000 / 1000 / 100 S/s. Settings repair: an image saved with Bias -1.0 and
+  Polarity "XEG" and zero 1234 restored as Bias 3.30 and NEG (defaults) with the zero 1234 kept, `GCFGERR` 0.
 - Not run on the QT Py (need I2C, the MIPS or the real front end): T5/T13/T15/T17 over `TWI_CMD` and binary opcodes, the
   real LT trigger, the electrometer baseline and `RCUR` sign, T16 (overlapping a trigger with a running `ZERO` needs a
   second path into the board).
@@ -354,6 +360,12 @@ something looks wrong.
    burst or during `ZERO`.
 4. **Overlap tests.** T16 (LT pulses and MIPS I2C traffic while `ZERO` runs) and the 30 minute soak T18 with the MIPS
    scanning and reading `0x8B`.
+
+**Also new in 1.2 (from the code review), check on the real module:** a `TWI_CMD` line that arrives while the
+board is still running a queued `SMODE`/`CONFIG`/`SAVE` is handed to the main loop and answered a moment later (a second
+one in that window gets NAK), so if the MIPS sends `SMODE` and polls immediately, the poll's reply may need a second read;
+`SPOL`/`SRNG` refuse partial words; `STWIADD` stores the address (needs `SAVE` and a reset, do not change it on the
+MIPS bench); the zero depends on `SSRATE`, so `ZERO` again after changing it.
 
 **Practical notes:** the Trinket build is `pio run -e adafruit_trinket_m0` and uploads with `--target upload`; uploading
 erases saved settings, so after flashing run `SNUMP,100`, `ZERO`, set the polarity/gain/range you use, then `SAVE`. The
