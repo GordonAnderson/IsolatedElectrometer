@@ -296,12 +296,15 @@ by 3 bytes. Read 4 bytes, or fix `gtwi()` to size the buffer from the request.
 one `SNUMP` change in the middle. Expect: no hangs or resets, `GTRIGMIS` only from pulses during bursts or ZERO,
 `GCFGERR` 0.
 Result:
-**MIPS, short soak PASS (30 min run still to do)**: emulated scan from the MIPS serial port: `DWRITE,13,PULSE` then
+**MIPS, 30 min PASS**: same emulated scan for 30 min: 7763 pulses, each read back as exactly count + 1 in `0x8B`, no missing
+reply; `ZERO` at 720 s (`TWI_CMD`, OK, 784) and `SNUMP,10` at 1080 s; afterwards `GCFGERR` 0, `GTRIGMIS` 0, ARMED, no hang
+or reset. The real MIPS QUAD scan was not used.
+**MIPS, short soak PASS**: emulated scan from the MIPS serial port: `DWRITE,13,PULSE` then
 `GTWI,01208B42` after each pulse. 2 min: 534 pulses, each read back as exactly count + 1 in `0x8B`, no missing reply; `ZERO` at
 48 s (`TWI_CMD`, OK, 788) and `SNUMP,10` at 72 s in the middle; afterwards `GCFGERR` 0, `GTRIGMIS` 0, ARMED. An earlier 5 min
 stretch of the 30 min run (stopped at the user's request) gave 1352 of 1352. The real MIPS QUAD scan was not used.
 **USB part PASS (120 s, not 30 min, no MIPS)**: 1107 commands, 498 `STRIG` ACK, 111 random `ZERO` / `SNUMP` / `SSRATE` /
-`CONFIG` / `GVER` events, no missing reply, no hang or reset; afterwards `GCFGERR` 0, `GTRIGMIS` 0, ARMED. MIPS scan soak still to do.
+`CONFIG` / `GVER` events, no missing reply, no hang or reset; afterwards `GCFGERR` 0, `GTRIGMIS` 0, ARMED. MIPS scan soak above.
 
 ## 5. Summary (fill in at the end)
 
@@ -324,7 +327,7 @@ stretch of the 30 min run (stopped at the user's request) gave 1352 of 1352. The
 | T15 | PASS | all bad I2C values ignored |
 | T16 | PASS | edges during ZERO dropped, not latched |
 | T17 | PASS | 0x8B/0xA1/0xA2 agree; RCUR sign not tested |
-| T18 | PASS (short) | 2 min + 5 min, 1886 of 1886 pulses; 30 min still to do |
+| T18 | PASS | 30 min, 7763 of 7763 pulses (plus 2 min + 5 min, 1886 of 1886) |
 
 Failures and anything unexpected, with the exact commands and replies:
 - November 1, 2026, Trinket over USB (MIPS on I2C and LT on TRIGIN, both idle, input quiet), run by Claude: **no failures.**
