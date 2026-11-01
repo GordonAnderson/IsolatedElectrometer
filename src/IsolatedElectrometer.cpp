@@ -30,6 +30,31 @@
 //   SCLIP 1 instead subtracts the zero and reports 0 for anything on the wrong side of it, the
 //   side set by the polarity: counts - zeroCounts in NEG, zeroCounts - counts in POS.
 //   SZERO / GZERO write and read zeroCounts directly.
+//
+// Revision history:
+//   1.1  October 31, 2026
+//     - ZERO: one reconfigure, baseline read from software bursts in modes 1 and 2 (the idle
+//       analogRead path sits thousands of counts away on the real front end), the last burst result
+//       (GTRIGCNT, RADC, RSUM) survives, NAK and unchanged zero/bias on failure. Over TWI_CMD ZERO
+//       replies ACK at once and runs from loop(); GZEROST reports NEVER/BUSY/OK/FAILED.
+//     - SMODE, CONFIG, SAVE sent with TWI_CMD are queued and run from loop(), never inside the I2C
+//       interrupt (malloc, ADC reset and waits for the DMA interrupt cannot work there).
+//     - SNUMP, SANUMS, SSRATE apply at once (rebuild in loop()), refuse out-of-range or non-fitting
+//       values with NAK, and fall back to the last working settings if a rebuild fails (GCFGERR).
+//       SNUMP default is 100 (was 1000). SSRATE limited to 100..100000 (the ADC sustains 100 kS/s).
+//     - Sample buffers are one static 12 KB pool, not malloc (the allocator never shrank the heap and
+//       the stack check then rejected buffers). SNUMP 10..5000, SANUMS 10..3000. Loops use the real
+//       buffer sizes, never the settings.
+//     - Mode 2 scaling is filteredSum*16/averageSamples (was /(averageSamples/16): +0.8%, divide by
+//       zero below 16 samples); the IIR filter seeds from the first buffer. Mode 2 only: modes 0 and 1
+//       never use the filter.
+//     - Settings from flash/RESTORE are range checked; I2C setters (mode, gain, bias, filter) ignore
+//       bad values; TWI_READ_ADC/CUR read zero current before the first burst.
+//     - Trigger arming: mux and attach first, clear the latched edge, then ARMED (no burst without a
+//       trigger); an edge while not armed is ignored. A timed-out burst stops its DMA job.
+//     - ADC.cpp reports a failed DMA channel/descriptor setup (configureDMAADC returns -1).
+//     - Optional QT Py M0 test build (env adafruit_qtpy_m0: ADC input on RX/A7, trigger on A3).
+//   1.0  September 9, 2025   First release.
 
 // ---- Feature selection ----
 #define AppName        "IsoElectrometer"
@@ -53,7 +78,9 @@
 // ---- Other library includes ----
 #include <FlashStorage.h>
 #include <FlashAsEEPROM.h>
+#ifndef NO_DOTSTAR
 #include <Adafruit_DotStar.h>
+#endif
 
 // ---- Local includes ----
 #include "ADC.h"
@@ -98,7 +125,7 @@ Data Rev_1_data =
     100000,       // actualSampleRate — filled in by configureDMAADC()
     1,            // adcGain         — unity gain
     1000,         // averageSamples  — 1000 samples per IIR update
-    1000,         // numberOfPoints  — 1000 points per triggered burst
+    100,          // numberOfPoints  — 100 points per triggered burst
     10,           // filter          — 10 Hz IIR break frequency
     3.3f,         // Bias            — 3.3 V (full-scale)
     1977,         // Calfactor       — ADC counts per nA at unit gain
@@ -114,7 +141,7 @@ Data Rev_1_data =
 // Note: the storage area is erased each time the sketch is uploaded.
 FlashStorage(flash_data, Data);
 
-const char *Version = AppName ", version 1.0 Sept 9, 2025";
+const char *Version = AppName ", version 1.1 Oct 31, 2026";
 
 // =========================================================================
 // Application state
@@ -131,18 +158,37 @@ const char *status           = "Idle";
 #define TRIG_PROCESSING 3   ///< Burst complete; loop() is summing it
 volatile int trigState   = TRIG_IDLE;
 bool         trigAttached= false;   ///< True while the TRIGIN interrupt is attached
+volatile bool zeroing    = false;   ///< True while zero() runs; software triggers are refused
+#define ZERO_NEVER   0   ///< No ZERO since boot
+#define ZERO_BUSY    1   ///< Requested or running
+#define ZERO_OK      2   ///< Last ZERO updated zeroCounts
+#define ZERO_FAILED  3   ///< Last ZERO could not read the baseline; zeroCounts unchanged
+volatile int zeroStatus  = ZERO_NEVER;  ///< Progress of the last ZERO (GZEROST)
 volatile int trigMissed  = 0;   ///< Triggers ignored because a burst was in progress
 int          trigResults = 0;   ///< Completed bursts since mode 1 was entered
 int          trigSum     = 0;   ///< Sum of the last burst's 12-bit samples (max 4095 * 100000), raw
 int          trigSumN    = 1;   ///< Number of samples in that sum (SNUMP when the burst ran)
 bool         trigValid   = false;///< True once at least one burst has completed
 
-int   buffer0count = 0;  ///< Number of times buffer A has been filled (mode 2)
-int   buffer1count = 0;  ///< Number of times buffer B has been filled (mode 2)
+volatile int buffer0count = 0;  ///< Number of times buffer A has been filled (mode 2)
+volatile int buffer1count = 0;  ///< Number of times buffer B has been filled (mode 2)
 float filterC      = 1;  ///< IIR filter coefficient (0 < filterC ≤ 1)
 int   buffer0sum   = 0;  ///< Running sum from buffer A
 int   buffer1sum   = 0;  ///< Running sum from buffer B
-int   filteredSum  = 0;  ///< IIR-filtered sum (used to derive current in mode 2)
+volatile int filteredSum   = 0;     ///< IIR-filtered sum of avgSamples samples (used to derive current in mode 2)
+volatile bool filterPrimed = false; ///< False until the first mode-2 buffer seeds filteredSum
+
+// Sizes the buffers were really allocated with. All the loops that walk a buffer use these,
+// never data.numberOfPoints / data.averageSamples: a setting can change (or be restored from
+// flash) before loop() has rebuilt the buffers, and the loops must not run past the old ones.
+int   dataPoints   = 0;  ///< Samples in dataBuffer (mode 1), 0 when not allocated
+int   avgSamples   = 0;  ///< Samples in each averageBuffers[] (mode 2), 0 when not allocated
+
+// Last configuration that configure() accepted, restored if a pending change cannot be applied.
+int   goodPoints   = 0;
+int   goodSamples  = 0;
+int   goodRate     = 0;
+int   configErrors = 0;  ///< Configurations rejected since boot (GCFGERR)
 
 // TWI deferred-action flags — set in receiveEvent() (ISR context), acted on
 // in loop() (main-loop context) to keep the ISR short.
@@ -160,8 +206,10 @@ float current   = 0;   ///< Calibrated electrometer current in Range units
 // Peripherals
 // =========================================================================
 
+#ifndef NO_DOTSTAR
 // Internal DotStar LED (data on INTERNAL_DS_DATA, clock on INTERNAL_DS_CLK).
 Adafruit_DotStar strip = Adafruit_DotStar(1, INTERNAL_DS_DATA, INTERNAL_DS_CLK, DOTSTAR_BGR);
+#endif
 
 commandProcessor cp;
 debug            dbg(&cp);
@@ -170,8 +218,8 @@ debug            dbg(&cp);
 // Command parameter range tables
 // =========================================================================
 
-const int   rngSrate[2]  = {100, 250000};
-const int   rngAnum[2]   = {10, 10000};
+const int   rngSrate[2]  = {100, 100000};   // The ADC (750 kHz clock) sustains 100 kS/s; faster requests lose events
+const int   rngAnum[2]   = {10, 3000};    // Two buffers of this many samples must fit the static pool
 const int   rngNpts[2]   = {10, 5000};   // 2 bytes/point; limited by 32 KB RAM
 const float rngFilter[2] = {1, 10000};
 const int   rngClip[2]   = {0, 1};
@@ -179,14 +227,22 @@ const int   rngZero[2]   = {0, 65535};
 const char *rngPolarity  = "POS,NEG";
 const char *rngRange     = "nA,pA";
 
+/** True for the six legal ADC gains. */
+static bool validGain(int g)
+{
+    return g == 1 || g == 2 || g == 4 || g == 8 || g == 16 || g == 32;
+}
+
 // =========================================================================
 // Forward declarations (functions defined later in this file)
 // =========================================================================
 bool  configure(void);
 void  setFilterFreq(float freq, float sampleRate);
-void  zero(void);
+bool  zero(void);
 void  applyBias(void);
 void  startAcquisition(void);
+bool  applyMode(int mode);
+static bool settingsValid(const Data &d);
 bool  softTrigger(void);
 
 // =========================================================================
@@ -223,16 +279,17 @@ Command cmds[] =
     {"GTRIGST", CMDfunction,  0, (void *)ReportTrigStatus,     NULL,              "Report trigger state, IDLE ARMED ACQUIRING PROCESSING"},
     {"GTRIGCNT",CMDint,       0, (void *)&trigResults,         NULL,              "Report the number of completed triggered bursts"},
     {"GTRIGMIS",CMDint,       0, (void *)&trigMissed,          NULL,              "Report the number of triggers missed during a burst"},
+    {"GCFGERR", CMDint,       0, (void *)&configErrors,        NULL,              "Report the number of configurations rejected (no memory or DMA) since boot"},
     {"RSUM",    CMDfunction,  0, (void *)ReportSum,            NULL,              "Report the last burst's signal sum, |sum - n*zeroCounts/16|"},
     // Sample rate
-    {"SSRATE",  CMDint,       1, (void *)&data.sampleRate,     (void *)rngSrate,  "Set the ADC sample rate, 100 to 250000 Hz"},
+    {"SSRATE",  CMDfunction,  1, (void *)SetSampleRate,        NULL,              "Set the ADC sample rate, 100 to 100000 Hz"},
     {"GSRATE",  CMDint,       0, (void *)&data.sampleRate,     NULL,              "Report the ADC sample rate"},
     {"GSRATEA", CMDint,       0, (void *)&data.actualSampleRate,NULL,             "Report the actual ADC sample rate"},
     // Averaging
-    {"SANUMS",  CMDint,       1, (void *)&data.averageSamples, (void *)rngAnum,   "Set the number of average samples, 10 to 10000"},
+    {"SANUMS",  CMDfunction,  1, (void *)SetAvgSamples,        NULL,              "Set the number of average samples, 10 to 3000"},
     {"GANUMS",  CMDint,       0, (void *)&data.averageSamples, NULL,              "Report the number of average samples"},
     // Vector length
-    {"SNUMP",   CMDint,       1, (void *)&data.numberOfPoints, (void *)rngNpts,   "Set the number of points in a triggered burst, 10 to 5000"},
+    {"SNUMP",   CMDfunction,  1, (void *)SetNumPoints,         NULL,              "Set the number of points in a triggered burst, 10 to 5000"},
     {"GNUMP",   CMDint,       0, (void *)&data.numberOfPoints, NULL,              "Report the number of points in a triggered burst"},
     // Filter
     {"SFILTER", CMDfloat,     1, (void *)&data.filter,         (void *)rngFilter, "Set the filter break frequency in Hz, 1 to 10000"},
@@ -244,7 +301,8 @@ Command cmds[] =
     {"SGAIN",   CMDfunction,  1, (void *)SetGain,              NULL,              "Set ADC gain, 1 2 4 8 16 32"},
     {"GGAIN",   CMDint,       0, (void *)&data.adcGain,        NULL,              "Report ADC gain"},
     // Zero
-    {"ZERO",    CMDfunction,  0, (void *)zeroCurrent,          NULL,              "Zero the electrometer output"},
+    {"ZERO",    CMDfunction,  0, (void *)zeroCurrent,          NULL,              "Zero the electrometer output (over TWI_CMD it replies ACK at once and runs in the background; poll GZEROST)"},
+    {"GZEROST", CMDfunction,  0, (void *)ReportZeroStatus,     NULL,              "Report the last ZERO: NEVER, BUSY, OK or FAILED"},
     {"SZERO",   CMDint,       1, (void *)&data.zeroCounts,     (void *)rngZero,   "Set the zero, 16-bit left-justified ADC counts, 0 to 65535"},
     {"GZERO",   CMDint,       0, (void *)&data.zeroCounts,     NULL,              "Report the zero, 16-bit left-justified ADC counts"},
     // Polarity and range
@@ -332,6 +390,34 @@ void requestEvent(void)
     wh.requestEventProcessor();
 }
 
+/** True if the line is exactly this command with no arguments (case-insensitive, optional
+ *  trailing CR/LF/spaces). */
+static bool isExactCommand(const char *line, const char *name)
+{
+    size_t n = strlen(name);
+    if (strncasecmp(line, name, n) != 0) return false;
+    for (const char *c = line + n; *c; c++)
+        if (*c != '\r' && *c != '\n' && *c != ' ') return false;
+    return true;
+}
+
+/** True for TWI_CMD command lines that must not run inside the I2C interrupt: they
+ *  reconfigure the ADC/DMA (SMODE, CONFIG) or write flash (SAVE). The line stays in the
+ *  command ring buffer and loop() runs it; its reply is staged when it finishes. (ZERO is
+ *  handled before this: it answers at once, see receiveEvent.) */
+static bool runsInLoop(const char *line)
+{
+    static const char *names[] = {"SMODE", "CONFIG", "SAVE"};
+    for (unsigned int i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+    {
+        size_t n = strlen(names[i]);
+        if (strncasecmp(line, names[i], n) != 0) continue;
+        char c = line[n];
+        if (c == 0 || c == DELIM || c == ' ' || c == '\r' || c == '\n') return true;
+    }
+    return false;
+}
+
 /** Called by the Wire ISR when the master sends data to this device.
  *
  *  Most write commands set a deferred-action flag that is handled in loop()
@@ -374,21 +460,48 @@ void receiveEvent(int howMany)
                 break;
 
             case TWI_CMD:
-                // Receive one ASCII command line, process it, and buffer the
-                // response for the next master read.
-                wh.sb.clear();
-                for (i = 0; i < 100; i++)
+                // Receive one ASCII command line and buffer the response for the next master
+                // read.
+                //  - ZERO takes a fraction of a second or more and the MIPS will not wait for
+                //    it, so it is only requested here: ACK at once, loop() runs it, and the
+                //    caller asks GZEROST whether it has finished. (NAK if one is already running.)
+                //  - SMODE, CONFIG and SAVE reconfigure the hardware or write flash, which is
+                //    unsafe inside the I2C interrupt (the DMA interrupt cannot run until it
+                //    returns): the line is queued and loop() runs it; the reply is staged when
+                //    it finishes.
+                //  - Everything else runs here and replies at once.
                 {
-                    if (Wire.available() != 0)
+                    char line[101];
+                    int  len = 0;
+                    wh.sb.clear();
+                    for (i = 0; i < 100; i++)
                     {
-                        cmd = Wire.read();
-                        cp.rb->put(cmd);
-                        if (cmd == '\n') break;
+                        if (Wire.available() != 0)
+                        {
+                            cmd = Wire.read();
+                            if (len < 100) line[len++] = (char)cmd;
+                            if (cmd == '\n') break;
+                        }
+                        delayMicroseconds(100);
                     }
-                    delayMicroseconds(100);
+                    line[len] = 0;
+                    cp.selectStream(&wh.sb);
+                    if (isExactCommand(line, "ZERO"))
+                    {
+                        if (zeroStatus == ZERO_BUSY) cp.sendNAK();
+                        else
+                        {
+                            zeroStatus  = ZERO_BUSY;
+                            requestZero = true;
+                            cp.sendACK();
+                        }
+                    }
+                    else
+                    {
+                        for (int k = 0; k < len; k++) cp.rb->put(line[k]);
+                        if (!runsInLoop(line)) cp.processCommands();
+                    }
                 }
-                cp.selectStream(&wh.sb);
-                cp.processCommands();
                 break;
 
             // ---- Status / buffer queries ----
@@ -399,7 +512,7 @@ void receiveEvent(int howMany)
 
             // ---- Mode ----
             case TWI_SET_MODE:
-                if (wh.ReadByte(&b)) requestMode = b;
+                if (wh.ReadByte(&b) && b >= 0 && b <= 2) requestMode = b;
                 break;
             case TWI_READ_MODE:
                 wh.SendByte(data.mode);
@@ -407,7 +520,7 @@ void receiveEvent(int howMany)
 
             // ---- Gain ----
             case TWI_SET_GAIN:
-                if (wh.ReadByte(&b)) requestGain = b;
+                if (wh.ReadByte(&b) && validGain(b)) requestGain = b;
                 break;
             case TWI_READ_GAIN:
                 wh.SendByte(data.adcGain);
@@ -423,7 +536,14 @@ void receiveEvent(int howMany)
 
             // ---- Bias ----
             case TWI_SET_BIAS:
-                if (wh.ReadFloat(&data.Bias)) requestBias = true;
+                {
+                    float v;
+                    if (wh.ReadFloat(&v) && v >= 0.0f && v <= 3.3f)   // false for NaN too
+                    {
+                        data.Bias = v;
+                        requestBias = true;
+                    }
+                }
                 break;
             case TWI_READ_BIAS:
                 wh.SendFloat(data.Bias);
@@ -431,7 +551,10 @@ void receiveEvent(int howMany)
 
             // ---- Filter ----
             case TWI_SET_FILTER:
-                wh.ReadFloat(&data.filter);
+                {
+                    float v;
+                    if (wh.ReadFloat(&v) && v >= rngFilter[0] && v <= rngFilter[1]) data.filter = v;
+                }
                 break;
             case TWI_READ_FILTER:
                 wh.SendFloat(data.filter);
@@ -439,7 +562,11 @@ void receiveEvent(int howMany)
 
             // ---- Zero ----
             case TWI_ZERO:
-                requestZero = true;
+                if (zeroStatus != ZERO_BUSY)
+                {
+                    zeroStatus  = ZERO_BUSY;
+                    requestZero = true;
+                }
                 break;
             case TWI_SET_ZERO:
                 {
@@ -630,6 +757,7 @@ void vectorAcquired(void)
  *  Ignored (and counted) if the system is not armed. */
 void acquireNow(void)
 {
+    if (trigState == TRIG_IDLE) return;   // Not armed (for example an edge while arming): nothing was missed
     if (trigState != TRIG_ARMED)
     {
         trigMissed++;
@@ -645,16 +773,27 @@ void triggerISR(void)
     acquireNow();
 }
 
-/** Arm the trigger: enable the TRIGIN interrupt and wait for an edge. */
+/** Arm the trigger: enable the TRIGIN interrupt and wait for an edge.
+ *
+ *  The pad is muxed to the EIC here, and first: muxing or changing the sense with the pin
+ *  floating can latch an edge, which used to arrive after the state was already ARMED and
+ *  run a burst nobody asked for. The state becomes ARMED only after the flag from that edge
+ *  has been cleared. Which EIC line TRIGIN uses depends on the board: in the Trinket M0
+ *  variant file, pin 4 is PA06 (EXTINT6); an earlier comment here and the README call it
+ *  PA08, the NMI pin. Both are handled (the core's attachInterrupt() muxes an ordinary
+ *  EXTINT pin itself but not the NMI pad). */
 void armTrigger(void)
 {
-    trigState = TRIG_ARMED;
+    trigState = TRIG_IDLE;
     pinMode(TRIGIN, INPUT);
-    attachInterrupt(digitalPinToInterrupt(TRIGIN), triggerISR, RISING);
-    // TRIGIN (PA08) is the NMI pin.  The Arduino core's attachInterrupt() sets up
-    // the NMI sense and callback but does not mux the pad to the EIC, so do it here.
     pinPeripheral(TRIGIN, PIO_EXTINT);
+    attachInterrupt(digitalPinToInterrupt(TRIGIN), triggerISR, RISING);
+    delayMicroseconds(10);
+    uint32_t ext = g_APinDescription[TRIGIN].ulExtInt;   // Discard an edge latched while the sense was changing
+    if (ext == EXTERNAL_INT_NMI) EIC->NMIFLAG.reg = EIC_NMIFLAG_NMI;
+    else if (ext < 16)           EIC->INTFLAG.reg = 1u << ext;
     trigAttached = true;
+    trigState = TRIG_ARMED;
 }
 
 /** Start sampling for the current mode: arm the trigger in mode 1, start the
@@ -665,27 +804,53 @@ void startAcquisition(void)
     else if (data.mode == 2) { if (averageBuffers[1] != NULL) startDMA(); }
 }
 
-/** Sum a completed mode-1 burst, publish the result, and re-arm. */
+/** Sum a completed mode-1 burst, publish the result, and re-arm. Sums dataPoints, the size
+ *  of the buffer the DMA really filled (not data.numberOfPoints, which may have changed). */
 void processTriggeredBurst(void)
 {
     uint32_t sum = 0;
-    for (int i = 0; i < data.numberOfPoints; i++) sum += dataBuffer[i];
+    int      n   = dataPoints;
+    if (dataBuffer == NULL || n <= 0)
+    {
+        trigState = TRIG_ARMED;
+        return;
+    }
+    for (int i = 0; i < n; i++) sum += dataBuffer[i];
 
+    // Publish the sum, its size and the count together so a TWI read from the I2C
+    // interrupt (0x8B) never sees half of an update.
+    noInterrupts();
     trigSum   = (int)sum;
-    trigSumN  = data.numberOfPoints;
+    trigSumN  = n;
     // Average of 12-bit samples, left-justified to 16 bits like modes 0 and 2.
-    ADCcounts = (int)(((uint64_t)sum * 16) / (uint32_t)data.numberOfPoints);
+    ADCcounts = (int)(((uint64_t)sum * 16) / (uint32_t)n);
     trigValid = true;
     trigResults++;
+    interrupts();
     trigState = TRIG_ARMED;   // Re-arm; the DMA job is restarted by the next trigger
+}
+
+/** Fold one finished mode-2 buffer sum into the IIR filter:
+ *  y += filterC * (x - y), the same as filterC*x + (1 - filterC)*y but exact in the large
+ *  sums (a float multiply of the sum itself lost low bits). The first buffer after a
+ *  (re)configure seeds the filter, so the reading does not ramp up from 0. */
+static void filterSum(int sum)
+{
+    if (!filterPrimed)
+    {
+        filteredSum = sum;
+        filterPrimed = true;
+        return;
+    }
+    filteredSum += (int)(filterC * (float)(sum - filteredSum));
 }
 
 /** Called by dmaBufferAcompleteCB when buffer A is full (mode 2 ping-pong). */
 void buffer0complete(uint32_t buffer)
 {
     buffer0sum = 0;
-    for (int i = 0; i < data.averageSamples; i++) buffer0sum += (int)averageBuffers[0][i];
-    filteredSum = (int)(buffer0sum * filterC + filteredSum * (1.0f - filterC));
+    for (int i = 0; i < avgSamples; i++) buffer0sum += (int)averageBuffers[0][i];
+    filterSum(buffer0sum);
     buffer0count++;
 }
 
@@ -693,45 +858,53 @@ void buffer0complete(uint32_t buffer)
 void buffer1complete(uint32_t buffer)
 {
     buffer1sum = 0;
-    for (int i = 0; i < data.averageSamples; i++) buffer1sum += (int)averageBuffers[1][i];
-    filteredSum = (int)(buffer1sum * filterC + filteredSum * (1.0f - filterC));
+    for (int i = 0; i < avgSamples; i++) buffer1sum += (int)averageBuffers[1][i];
+    filterSum(buffer1sum);
     buffer1count++;
+}
+
+/** The mode-2 reading as 16-bit left-justified counts: the filtered sum of avgSamples 12-bit
+ *  samples times 16 over avgSamples. (This used to divide by avgSamples / 16 in integers,
+ *  which is 62 instead of 62.5 for 1000 samples, 0.8% high, and 0 below 16 samples.) */
+static int mode2Counts(void)
+{
+    if (avgSamples <= 0) return data.zeroCounts;
+    return (int)(((int64_t)filteredSum * 16) / avgSamples);
 }
 
 // =========================================================================
 // System configuration
 // =========================================================================
 
-/** Allocate buffers and configure DMA/ADC for the current data.mode.
- *
- *  Always stops any running DMA and frees existing buffers first.
- *  After a successful return, call startAcquisition() to begin (mode 1 arms the
- *  trigger; mode 2 starts the DMA).
- *
- *  @return true on success; false if a buffer cannot be allocated safely.
- */
-/** Bytes kept free between the top of the heap and the stack. */
-#define STACK_RESERVE 4096
+/** All sample buffers live in one static pool instead of the heap. The newlib allocator hands out
+ *  blocks from the top end of free memory and never shrinks the heap, so after one large request
+ *  (even a refused one) later buffers landed next to the stack and were rejected, and a request
+ *  that did fit could still be placed where a deep call chain would overwrite it. A fixed pool
+ *  cannot fragment, creep or collide with the stack, and sizes are known at build time:
+ *    mode 1: one buffer of SNUMP samples (up to 5000)
+ *    mode 2: two buffers of SANUMS samples each (up to POOL_SAMPLES / 2 = 3000 each) */
+#define POOL_SAMPLES 6000
+static uint16_t samplePool[POOL_SAMPLES] __attribute__((aligned(4)));
 
-/** malloc() that refuses allocations that would run into the stack.
- *
- *  The newlib _sbrk() in this core has no heap/stack collision check, so a
- *  large malloc() can succeed while overlapping the stack; the DMA then
- *  overwrites the stack when it fills the buffer.
- */
-static void *safeMalloc(size_t bytes)
+/** Would the buffers for these settings fit in the pool in this mode? Pure arithmetic, so a
+ *  setter can answer in the I2C handler. */
+static bool buffersFit(int mode, int points, int samples)
 {
-    void *p = malloc(bytes);
-    if (p == NULL) return NULL;
-    char stackMarker;   // its address approximates the current stack pointer
-    if ((char *)p + bytes + STACK_RESERVE > &stackMarker)
-    {
-        free(p);
-        return NULL;
-    }
-    return p;
+    if (mode == 1) return points >= 1 && points <= POOL_SAMPLES;
+    if (mode == 2) return samples >= 1 && (long)samples * 2 <= POOL_SAMPLES;
+    return true;
 }
 
+/** Allocate buffers and configure DMA/ADC for the current data.mode.
+ *
+ *  Always stops any running DMA and frees existing buffers first. On failure the buffers
+ *  are left unassigned (dataPoints / avgSamples are 0), so nothing walks a missing buffer.
+ *  After a successful return, call startAcquisition() to begin (mode 1 arms the trigger;
+ *  mode 2 starts the DMA). Runs from loop() only: it resets the ADC and timer.
+ *
+ *  @return true on success; false if the settings do not fit the sample pool or the DMA
+ *          channel could not be set up.
+ */
 bool configure(void)
 {
     // Disable the trigger interrupt and halt any running DMA transfer.
@@ -748,16 +921,19 @@ bool configure(void)
     trigMissed  = 0;
     stopDMA();
 
-    // Release previously allocated sample buffers.
-    free(dataBuffer);        dataBuffer        = NULL;
-    free(averageBuffers[0]); averageBuffers[0] = NULL;
-    free(averageBuffers[1]); averageBuffers[1] = NULL;
+    // Release the sample buffers (they are carved out of samplePool, nothing to free).
+    dataBuffer        = NULL;
+    averageBuffers[0] = NULL;
+    averageBuffers[1] = NULL;
+    dataPoints = 0;
+    avgSamples = 0;
 
     // Clear all DMA completion callbacks.
     dmaCompleteCB        = NULL;
     dmaBufferAcompleteCB = NULL;
     dmaBufferBcompleteCB = NULL;
 
+    int rate = 0;
     if (data.mode == 0)
     {
         // Mode 0 — Idle: use the standard Arduino analogRead() path (no DMA).
@@ -768,58 +944,90 @@ bool configure(void)
     {
         // Mode 1 — Triggered burst: fill one buffer per trigger, then stop.
         // The DMA job is started by the trigger (see armTrigger()).
-        dataBuffer = (uint16_t *)safeMalloc(data.numberOfPoints * sizeof(uint16_t));
-        if (dataBuffer == NULL) return false;
+        if (!buffersFit(1, data.numberOfPoints, 0)) return false;
+        dataBuffer = samplePool;
 
         dmaCompleteCB = vectorAcquired;
-        data.actualSampleRate = configureDMAADC(
+        rate = configureDMAADC(
             data.adcGain, data.sampleRate,
             (uint32_t)dataBuffer, 0, data.numberOfPoints);
+        if (rate < 0)
+        {
+            dataBuffer = NULL;
+            dmaCompleteCB = NULL;
+            return false;
+        }
+        dataPoints = data.numberOfPoints;
     }
     else if (data.mode == 2)
     {
         // Mode 2 — Continuous ping-pong: alternate between two equal-size buffers.
-        averageBuffers[0] = (uint16_t *)safeMalloc(data.averageSamples * sizeof(uint16_t));
-        if (averageBuffers[0] == NULL) return false;
-
-        averageBuffers[1] = (uint16_t *)safeMalloc(data.averageSamples * sizeof(uint16_t));
-        if (averageBuffers[1] == NULL) return false;
+        if (!buffersFit(2, 0, data.averageSamples)) return false;
+        averageBuffers[0] = samplePool;
+        averageBuffers[1] = samplePool + data.averageSamples;
 
         dmaBufferAcompleteCB = buffer0complete;
         dmaBufferBcompleteCB = buffer1complete;
         buffer0count = buffer1count = 0;
+        filterPrimed = false;
+        filteredSum  = 0;
         setFilterFreq(data.filter, (float)data.sampleRate / data.averageSamples);
 
-        data.actualSampleRate = configureDMAADC(
+        rate = configureDMAADC(
             data.adcGain, data.sampleRate,
             (uint32_t)averageBuffers[0], (uint32_t)averageBuffers[1], data.averageSamples);
+        if (rate < 0)
+        {
+            averageBuffers[0] = NULL;
+            averageBuffers[1] = NULL;
+            dmaBufferAcompleteCB = NULL;
+            dmaBufferBcompleteCB = NULL;
+            return false;
+        }
+        avgSamples = data.averageSamples;
     }
 
+    if (rate > 0) data.actualSampleRate = rate;
+    goodPoints  = data.numberOfPoints;
+    goodSamples = data.averageSamples;
+    goodRate    = data.sampleRate;
     return true;
+}
+
+/** configure() for a change that was already accepted: if the hardware cannot take it,
+ *  count the error and go back to the last settings that worked. loop() only.
+ *  @return true if the requested settings are now running. */
+static bool reconfigure(void)
+{
+    if (configure()) return true;
+    configErrors++;
+    data.numberOfPoints = goodPoints  > 0 ? goodPoints  : Rev_1_data.numberOfPoints;
+    data.averageSamples = goodSamples > 0 ? goodSamples : Rev_1_data.averageSamples;
+    data.sampleRate     = goodRate    > 0 ? goodRate    : Rev_1_data.sampleRate;
+    if (!configure()) { data.mode = 0; configure(); }
+    return false;
 }
 
 // =========================================================================
 // Zeroing
 // =========================================================================
 
-/** Zero the electrometer and send an ACK to the command processor. */
-void zeroCurrent(void)
-{
-    zero();
-    cp.sendACK();
-}
+/** Samples averaged for the recorded zero, and for each step of the POS bias search. */
+#define ZERO_SAMPLES        1000
+#define ZERO_SEARCH_SAMPLES 200
 
 /** Average the ADC through the mode-1 burst DMA path (the path RSUM and mode 2 use),
- *  16-bit left-justified. Fires software bursts of numberOfPoints at sampleRate until at
- *  least minSamples are summed. Leaves data.mode at 1; the caller restores it.
+ *  16-bit left-justified. Fires software bursts of dataPoints at sampleRate until at
+ *  least minSamples are summed. The caller must have configured mode 1 (configure()) and
+ *  has the trigger interrupt detached. Runs from loop() only: it waits for the DMA
+ *  interrupt, which cannot run inside the I2C handler.
  *  @return The average, or -1 if a burst did not complete. */
 int readBurstAverage(int minSamples)
 {
-    data.mode = 1;
-    if (!configure()) return -1;
+    if (dataBuffer == NULL || dataPoints <= 0) return -1;
 
     int rate = (data.actualSampleRate > 0) ? data.actualSampleRate : data.sampleRate;
-    uint32_t timeout = (uint32_t)((uint64_t)data.numberOfPoints * 1000 / rate) + 100;
+    uint32_t timeout = (uint32_t)((uint64_t)dataPoints * 1000 / rate) + 100;
     uint64_t sum = 0;
     int n = 0;
     while (n < minSamples)
@@ -828,68 +1036,126 @@ int readBurstAverage(int minSamples)
         acquireNow();
         uint32_t start = millis();
         while (trigState != TRIG_PROCESSING && millis() - start < timeout);
-        if (trigState != TRIG_PROCESSING) break;
-        for (int i = 0; i < data.numberOfPoints; i++) sum += dataBuffer[i];
-        n += data.numberOfPoints;
+        if (trigState != TRIG_PROCESSING)
+        {
+            stopDMA();   // A job left running would make every later startJob() fail silently
+            break;
+        }
+        for (int i = 0; i < dataPoints; i++) sum += dataBuffer[i];
+        n += dataPoints;
     }
     trigState = TRIG_IDLE;
     if (n == 0) return -1;
     return (int)((sum * 16) / (uint64_t)n);
 }
 
-/** Adjust the bias voltage to minimise the resting ADC reading, then record
- *  the resulting counts as zeroCounts.
+/** One baseline reading in the current data.mode: analogRead() in mode 0, software bursts
+ *  (the mode 1 DMA path) otherwise. @return 16-bit left-justified counts, or -1 on failure. */
+static int readBaseline(int samples)
+{
+    return (data.mode == 0) ? readAnalog(samples) : readBurstAverage(samples);
+}
+
+/** GZEROST — progress of the last ZERO: NEVER, BUSY (requested or running), OK or FAILED. */
+void ReportZeroStatus(void)
+{
+    static const char *names[] = {"NEVER", "BUSY", "OK", "FAILED"};
+    cp.sendACK(false);
+    cp.println(names[zeroStatus & 3]);
+}
+
+/** Zero the electrometer and reply ACK, or NAK if the baseline could not be read. */
+void zeroCurrent(void)
+{
+    if (zero()) cp.sendACK(); else cp.sendNAK();
+}
+
+/** Adjust the bias to minimise the resting ADC reading, then record the resulting counts
+ *  as zeroCounts.
  *
- *  The bias is set in mode 0 (idle / Arduino analogRead). The zero is then read through
- *  the path the selected mode measures with: analogRead in mode 0, a set of software
- *  bursts in modes 1 and 2. The two paths do not agree (in NEG at gain 1 analogRead read
- *  about 4200 where the bursts rested at about 1180), so a zero taken with analogRead is
- *  wrong for RSUM. The previous mode is restored at the end.
+ *  The baseline is read through the path the saved mode measures with: analogRead in mode 0,
+ *  software bursts (the mode 1 DMA path) in modes 1 and 2. The two paths do not agree (in
+ *  NEG at gain 1 analogRead read about 4200 where the bursts rested at about 1180), so a
+ *  zero taken with analogRead is wrong for RSUM.
+ *
+ *  Reconfigures once: into mode 1 (or mode 0) for the measurement, which is also the
+ *  final configuration for those modes; only mode 2 needs a second configure() to get its
+ *  own buffers back. The last burst result (trigValid, trigResults, trigMissed, trigSum,
+ *  ADCcounts) is kept, so RADC and GTRIGCNT survive a ZERO. Hardware triggers are not seen
+ *  while it runs. Runs from loop() only (see runsInLoop).
  *
  *  NEG mode: Bias = 0 V; zeroCounts is whatever the ADC reads with no current.
- *  POS mode: Bias is stepped down from (3.3 / gain) V until the analogRead value is
- *            below 65000 counts, then the reading is recorded as zeroCounts.
- */
-void zero(void)
+ *  POS mode: Bias is stepped down from (3.3 / gain) V until the reading is below 65000
+ *            counts, then that reading is recorded as zeroCounts.
+ *
+ *  @return true if zeroCounts was updated; false if a reading failed, in which case
+ *          zeroCounts and Bias are left as they were. */
+bool zero(void)
 {
-    int savedMode = data.mode;
-    data.mode = 0;
-    configure();
+    const int   savedMode   = data.mode;
+    const float savedBias   = data.Bias;
+    const bool  savedValid  = trigValid;
+    const int   savedCount  = trigResults;
+    const int   savedMissed = trigMissed;
+    const int   savedSum    = trigSum;
+    const int   savedSumN   = trigSumN;
+    const int   savedCounts = ADCcounts;
 
-    int counts;
-    if (strcmp("NEG", data.Polarity) == 0)
+    zeroing = true;
+    zeroStatus = ZERO_BUSY;
+    data.mode = (savedMode == 0) ? 0 : 1;
+    bool ok = configure();
+    if (ok) requestConfig = false;   // This configure() already applied any pending setting
+    int counts = -1;
+
+    if (ok)
     {
-        data.Bias = 0;
-        applyBias();
-        delay(10);
-        counts = readAnalog(1000);
-    }
-    else
-    {
-        // Start at the gain-scaled maximum and walk the bias downward.
-        data.Bias = 3.3f / (float)data.adcGain;
-        applyBias();
-        delay(5);
-        counts = readAnalog(1000);
-        while (counts > 65000)
+        if (strcmp("NEG", data.Polarity) == 0)
         {
-            if (data.Bias <= 0.0f) break;
-            data.Bias -= 0.01f;
+            data.Bias = 0;
+            applyBias();
+            delay(10);
+            counts = readBaseline(ZERO_SAMPLES);
+        }
+        else
+        {
+            // Start at the gain-scaled maximum and walk the bias downward.
+            data.Bias = 3.3f / (float)data.adcGain;
             applyBias();
             delay(5);
-            counts = readAnalog(1000);
+            counts = readBaseline(ZERO_SEARCH_SAMPLES);
+            while (counts > 65000)
+            {
+                if (data.Bias <= 0.0f) break;
+                data.Bias -= 0.01f;
+                applyBias();
+                delay(5);
+                counts = readBaseline(ZERO_SEARCH_SAMPLES);
+            }
+            if (counts >= 0) counts = readBaseline(ZERO_SAMPLES);
         }
     }
-    if (savedMode != 0)
+
+    if (counts >= 0) data.zeroCounts = counts;
+    else
     {
-        int burst = readBurstAverage(1000);
-        if (burst >= 0) counts = burst;
+        data.Bias = savedBias;
+        applyBias();
     }
-    data.zeroCounts = counts;
 
     data.mode = savedMode;
-    configure();
-    startAcquisition();
+    if (savedMode == 2) ok = configure() && ok;   // mode 2 needs its own buffers and DMA setup
+    startAcquisition();                           // re-arms mode 1, restarts mode 2
+
+    trigValid   = savedValid;
+    trigResults = savedCount;
+    trigMissed  = savedMissed;
+    trigSum     = savedSum;
+    trigSumN    = savedSumN;
+    ADCcounts   = savedCounts;
+    zeroing     = false;
+    zeroStatus  = (counts >= 0) ? ZERO_OK : ZERO_FAILED;
+    return counts >= 0;
 }
 
 // =========================================================================
@@ -898,14 +1164,16 @@ void zero(void)
 void setup()
 {
     // Extinguish the DotStar LED at startup.
+#ifndef NO_DOTSTAR
     strip.begin();
     strip.setPixelColor(0, 0, 0, 0);
     strip.show();
+#endif
 
     // Load persisted configuration; fall back to factory defaults if the
     // flash has never been written or the signature is invalid.
     data = flash_data.read();
-    if (data.Signature != SIGNATURE) data = Rev_1_data;
+    if (data.Signature != SIGNATURE || !settingsValid(data)) data = Rev_1_data;
 
     // Initialise the USB serial host interface.
     Serial.begin(0);
@@ -938,7 +1206,7 @@ void setup()
 
     // Apply bias and configure ADC/DMA for the stored mode.
     applyBias();
-    configure();
+    reconfigure();   // If the stored settings cannot run it falls back to defaults or mode 0 and counts GCFGERR
     startAcquisition();
 }
 
@@ -954,13 +1222,13 @@ void loop()
     control.run();
 #endif
 
-    // Process deferred TWI requests (set by receiveEvent() in ISR context).
+    // Process deferred requests (set by receiveEvent() in ISR context, or by setters that
+    // change the buffers or timing).
     if (requestMode != -1)
     {
-        data.mode = requestMode;
-        configure();
-        startAcquisition();
+        int m = requestMode;
         requestMode = -1;
+        applyMode(m);
     }
     if (requestGain != -1)
     {
@@ -980,15 +1248,16 @@ void loop()
     }
     if (requestConfig)
     {
-        configure();
-        startAcquisition();
         requestConfig = false;
+        reconfigure();
+        startAcquisition();
     }
 
     // Keep the global ADCcounts and current variables up to date.
     if (data.mode == 0) ADCcounts = analogRead(CUR) << 4;
-    if (data.mode == 2) ADCcounts = filteredSum / (data.averageSamples / 16);
+    if (data.mode == 2) ADCcounts = mode2Counts();
     if (data.mode == 1 && trigState == TRIG_PROCESSING) processTriggeredBurst();
+    if (data.mode == 1 && !trigValid) ADCcounts = data.zeroCounts;   // No burst yet: read as zero current, not garbage
     current = calculateCurrent(ADCcounts);
 }
 
@@ -1014,9 +1283,7 @@ void SetGain(void)
     if (!cp.getValue(&gain, 1, 32)) return cp.sendNAK();
 
     // Validate that the value is one of the legal discrete gains.
-    if (gain != 1  && gain != 2  && gain != 4  &&
-        gain != 8  && gain != 16 && gain != 32)
-        return cp.sendNAK();
+    if (!validGain(gain)) return cp.sendNAK();
 
     data.adcGain = gain;
     applyGain(gain);
@@ -1044,8 +1311,9 @@ void ReportADC(void)
     else if (data.mode == 2)
     {
         cp.sendACK(false);
-        cp.println(signalCounts(filteredSum / (data.averageSamples / 16)));
+        cp.println(signalCounts(mode2Counts()));
     }
+    else cp.sendNAK();
 }
 
 /** RSUM — report the last triggered burst's signal sum, |sum - n*zeroCounts/16| (0 before the first burst). */
@@ -1073,16 +1341,72 @@ void ReportCurrent(void)
     else if (data.mode == 2)
     {
         cp.sendACK(false);
-        cp.println(calculateCurrent(filteredSum / (data.averageSamples / 16)));
+        cp.println(calculateCurrent(mode2Counts()));
     }
+    else cp.sendNAK();
 }
 
-/** SMODE — change the operating mode and reconfigure the ADC/DMA subsystem. */
+/** Switch to a mode and start it. If the hardware cannot take it (no memory, no DMA
+ *  channel) the previous mode is put back and running.
+ *  @return true if the new mode is running. */
+bool applyMode(int mode)
+{
+    if (mode < 0 || mode > 2) return false;
+    int oldMode = data.mode;
+    data.mode = mode;
+    if (!configure())
+    {
+        configErrors++;
+        data.mode = oldMode;
+        if (!configure()) { data.mode = 0; configure(); }
+        startAcquisition();
+        return false;
+    }
+    startAcquisition();
+    return true;
+}
+
+/** SMODE — change the operating mode and reconfigure the ADC/DMA subsystem. NAK, with the
+ *  old mode still running, if it cannot be set up. */
 void SetMode(void)
 {
-    if (!cp.getValue(&data.mode, 0, 2)) return cp.sendNAK();
-    if (!configure()) return cp.sendNAK();
-    startAcquisition();
+    int mode;
+    if (!cp.getValue(&mode, 0, 2)) return cp.sendNAK();
+    if (!applyMode(mode)) return cp.sendNAK();
+    cp.sendACK();
+}
+
+/** SNUMP — set the number of points in a triggered burst. Refused (NAK) if the buffer
+ *  does not fit the sample pool. The buffer is rebuilt by loop(), which also works when this
+ *  runs inside the I2C handler; a mode 1 burst result is cleared when that happens. */
+void SetNumPoints(void)
+{
+    int v;
+    if (!cp.getValue(&v, rngNpts[0], rngNpts[1])) return cp.sendNAK();
+    if (!buffersFit(1, v, 0)) return cp.sendNAK();   // Checked for mode 1 whatever the mode now: it must be usable later
+    data.numberOfPoints = v;
+    if (data.mode == 1) requestConfig = true;
+    cp.sendACK();
+}
+
+/** SANUMS — set the number of samples per averaging period (mode 2). Same rules as SNUMP. */
+void SetAvgSamples(void)
+{
+    int v;
+    if (!cp.getValue(&v, rngAnum[0], rngAnum[1])) return cp.sendNAK();
+    if (!buffersFit(2, 0, v)) return cp.sendNAK();   // Checked for mode 2 whatever the mode now
+    data.averageSamples = v;
+    if (data.mode == 2) requestConfig = true;
+    cp.sendACK();
+}
+
+/** SSRATE — set the ADC sample rate. Applied by loop() in modes 1 and 2. */
+void SetSampleRate(void)
+{
+    int v;
+    if (!cp.getValue(&v, rngSrate[0], rngSrate[1])) return cp.sendNAK();
+    data.sampleRate = v;
+    if (data.mode != 0) requestConfig = true;
     cp.sendACK();
 }
 
@@ -1091,7 +1415,7 @@ void SetMode(void)
 bool softTrigger(void)
 {
     noInterrupts();
-    bool ok = (data.mode == 1 && trigState == TRIG_ARMED);
+    bool ok = (data.mode == 1 && trigState == TRIG_ARMED && !zeroing);
     if (ok) acquireNow();
     interrupts();
     return ok;
@@ -1112,12 +1436,40 @@ void ReportTrigStatus(void)
     cp.println(names[trigState & 3]);
 }
 
-/** CONFIG — re-apply all current settings without changing data values. */
+/** CONFIG — re-apply all current settings. NAK if they cannot be applied; the last
+ *  settings that worked are then back in force. */
 void Config(void)
 {
-    if (!configure()) return cp.sendNAK();
+    bool ok = reconfigure();
     startAcquisition();
-    cp.sendACK();
+    if (ok) cp.sendACK(); else cp.sendNAK();
+}
+
+// =========================================================================
+// Settings validation
+// =========================================================================
+
+/** True if every field of a configuration is inside the range its command accepts. Applied
+ *  to what is read from flash at boot and by RESTORE, so a corrupt or stale image can never
+ *  put an out-of-range size, mode or gain into use. */
+static bool settingsValid(const Data &d)
+{
+    if (d.mode < 0 || d.mode > 2) return false;
+    if (d.sampleRate < rngSrate[0] || d.sampleRate > rngSrate[1]) return false;
+    if (d.averageSamples < rngAnum[0] || d.averageSamples > rngAnum[1]) return false;
+    if (d.numberOfPoints < rngNpts[0] || d.numberOfPoints > rngNpts[1]) return false;
+    if (!validGain(d.adcGain)) return false;
+    if (!(d.filter >= rngFilter[0] && d.filter <= rngFilter[1])) return false;   // false for NaN
+    if (!(d.Bias >= 0.0f && d.Bias <= 3.3f)) return false;
+    if (!(d.Calfactor > 0.0f && d.Calfactor < 1.0e9f)) return false;
+    if (d.zeroCounts < 0 || d.zeroCounts > 65535) return false;
+    if (d.clipNegative != 0 && d.clipNegative != 1) return false;
+    if (strncmp(d.Polarity, "POS", 4) != 0 && strncmp(d.Polarity, "NEG", 4) != 0) return false;
+    if (strncmp(d.Range, "nA", 3) != 0 && strncmp(d.Range, "pA", 3) != 0) return false;
+#if UseWireClient
+    if (d.TWIadd < 8 || d.TWIadd > 119) return false;
+#endif
+    return true;
 }
 
 // =========================================================================
@@ -1142,7 +1494,17 @@ void RestoreSettings(void)
         cp.sendNAK();
         return;
     }
+    // Refuse an image that is out of range or whose buffers would not fit, and keep the
+    // running settings. Otherwise the buffers, bias and ADC are rebuilt by loop() (this can
+    // run in the I2C handler).
+    if (!settingsValid(td) || !buffersFit(1, td.numberOfPoints, 0) || !buffersFit(2, 0, td.averageSamples))
+    {
+        cp.sendNAK();
+        return;
+    }
     data = td;
+    requestBias   = true;
+    requestConfig = true;
     cp.sendACK();
 }
 

@@ -19,7 +19,7 @@ human-readable ASCII command interface over USB serial.
 |--------|-----|------------|
 | Ion-current input (ADC) | A3 | PA07 — ADC channel 7 |
 | Bias DAC output | A0 / DAC0 | PA02 |
-| Trigger input | D4 | PA08 |
+| Trigger input | D4 | PA06 (EXTINT6) per the Trinket M0 variant file; the signal arrives through an isolator |
 | Status LED | Internal DotStar | SPI (INTERNAL_DS_DATA / CLK) |
 | I²C (TWI client) | SDA / SCL | PA22 / PA23 |
 
@@ -89,8 +89,13 @@ Connect at any baud rate (USB CDC — baud setting is ignored).
 Commands are ASCII strings terminated with `\n`.  Responses are prefixed
 with `ACK` (success) or `NAK` (failure or out-of-range argument).
 **Arguments are comma separated, not space separated: `SMODE,1`, `SNUMP,100`, `SSRATE,10000`.**
-(The tables below show the argument range in the second column.) A change to `SSRATE`, `SNUMP` and similar
-settings needs `CONFIG` to take effect while a mode is running.
+(The tables below show the argument range in the second column.) `SSRATE`, `SNUMP` and `SANUMS` take effect at once:
+the buffers and DMA are rebuilt by the main loop right after the reply, so `CONFIG` is no longer needed (in mode 1 the
+held burst result is cleared by the rebuild, so `RADC` NAKs until the next trigger). They reply NAK, and change nothing,
+if the value is out of range or its buffers would not fit the static sample pool. If a rebuild still fails, the last working settings
+are restored and `GCFGERR` counts it. Settings read from flash at boot (and `RESTORE`) are range checked as a whole;
+an invalid image is replaced by the defaults (boot) or refused with NAK (`RESTORE`). I2C setters (mode, gain, bias,
+filter) ignore out-of-range values.
 
 ### System
 
@@ -110,21 +115,22 @@ settings needs `CONFIG` to take effect while a mode is running.
 |---------|-----------|-------------|
 | `SMODE` | `0`\|`1`\|`2` | Set operating mode (see table above) |
 | `GMODE` | — | Report current mode |
-| `CONFIG` | — | Re-apply all settings without changing values |
+| `CONFIG` | — | Re-apply all settings; NAK (last working settings restored) if they cannot be applied |
+| `GCFGERR` | — | Number of configurations rejected (no memory or DMA) since boot |
 
 ### Sampling
 
 | Command | Arguments | Description |
 |---------|-----------|-------------|
-| `SSRATE` | `100`–`250000` | Set ADC sample rate (Hz). **The ADC sustains 100 kHz at its current clock**; above that trigger events are lost and bursts take longer than the rate says (see TODO.md) |
+| `SSRATE` | `100`–`100000` | Set ADC sample rate (Hz). The limit is the ADC: at its current 750 kHz clock it sustains 100 kS/s, and faster requests lose trigger events (bursts took 2 to 3 times longer than the rate says). Raising it needs a faster ADC clock (see TODO.md) |
 | `GSRATE` | — | Report requested sample rate |
 | `GSRATEA` | — | Report actual achieved sample rate |
-| `SANUMS` | `10`–`10000` | Set number of samples per averaging period (mode 2) |
+| `SANUMS` | `10`–`3000` | Set number of samples per averaging period (mode 2). Two buffers of this size must fit the 12 KB static sample pool |
 | `GANUMS` | — | Report averaging sample count |
-| `SNUMP` | `10`–`100000` | Set number of points in a vector capture (mode 1) |
+| `SNUMP` | `10`–`5000` | Set number of points in a vector capture (mode 1). Limited by the 12 KB static sample pool |
 | `GNUMP` | — | Report vector length |
-| `SFILTER` | `1`–`10000` | Set IIR filter break frequency (Hz) |
-| `GFILTER` | — | Report filter break frequency |
+| `SFILTER` | `1`–`10000` | Set IIR filter break frequency (Hz). **Mode 2 only**: the filter smooths the continuous averages; modes 0 and 1 never use it, so it has no effect on triggered bursts |
+| `GFILTER` | — | Report filter break frequency (mode 2 only, see `SFILTER`) |
 
 ### Measurement
 
@@ -139,6 +145,7 @@ settings needs `CONFIG` to take effect while a mode is running.
 | `ZERO` | — | Auto-zero: adjust bias to minimise resting current |
 | `SZERO` | `0`–`65535` | Set `zeroCounts` (16-bit left-justified ADC counts) |
 | `GZERO` | — | Report `zeroCounts` |
+| `GZEROST` | — | Report the last `ZERO`: `NEVER`, `BUSY`, `OK` or `FAILED` (poll this after a `ZERO` over TWI) |
 | `SCLIP` | `0`\|`1` | `1` makes the count commands (`RADC`, `RSUM`, TWI `0xA1`, the sum in TWI `0x8B`) subtract the zero and report 0 for anything on the wrong side of it, the side set by the polarity: `counts − zeroCounts` in `NEG`, `zeroCounts − counts` in `POS`. `0` (default) reports the magnitude. `RCUR` is unaffected |
 | `GCLIP` | — | Report count clipping |
 | `SPOL` | `POS`\|`NEG` | Set signal polarity |
@@ -172,7 +179,7 @@ read transaction to retrieve it.
 | `0x0B` | `TWI_TRIGGER` | Write | Software trigger, same as a TRIGIN rising edge (mode 1) |
 | `0x0C` | `TWI_SET_ZERO` | Write (uint16) | Set `zeroCounts` |
 | `0x27` | `TWI_SERIAL` | Write | Enter serial-talk mode (stream ASCII commands; ESC to exit) |
-| `0x7F` | `TWI_CMD` | Write + read | Send one ASCII command line; read response |
+| `0x7F` | `TWI_CMD` | Write + read | Send one ASCII command line; read response. `ZERO` replies ACK at once and runs in the background (poll `GZEROST`); `SMODE`, `CONFIG` and `SAVE` run from the main loop and reply when done (poll `0x82`) |
 | `0x82` | `TWI_READ_AVALIBLE` | Read (uint16) | Bytes available in output buffer |
 | `0x83` | `TWI_READ_MODE` | Read (int8) | Current mode |
 | `0x84` | `TWI_READ_GAIN` | Read (int8) | ADC gain |
@@ -216,9 +223,20 @@ sum (n = `SNUMP` when the burst ran), so they rise with the size of the current 
 - **NEG polarity** — sets Bias to 0 V and records the resting ADC value as `zeroCounts`
 - **POS polarity** — starts Bias at `3.3 / adcGain` V and steps it down until the
   reading falls below 65000 counts, then records that value as `zeroCounts`
-- The bias is set using `analogRead()`, but in modes 1 and 2 the recorded zero is the average of software bursts
-  (at least 1000 samples at `SSRATE`), the same DMA path `RSUM` uses: the two paths do not agree (NEG, gain 1:
-  `analogRead()` about 4200, bursts about 1180). In mode 0 the `analogRead()` value is kept. `SZERO` overrides it.
+- The baseline (and each step of the POS bias search) is read through the path the saved mode measures with: in modes 1
+  and 2 the average of software bursts (at least 1000 samples at `SSRATE`, 200 per search step), the same DMA path
+  `RSUM` uses; in mode 0 `analogRead()`. The two paths do not agree (NEG, gain 1: `analogRead()` about 4200, bursts
+  about 1180). `SZERO` overrides the result.
+- `ZERO` replies ACK when it finishes, or NAK (leaving `zeroCounts` and the bias unchanged) if a reading failed. It
+  reconfigures once, keeps the last burst result (`GTRIGCNT`, `RADC`, `RSUM` do not reset) and misses hardware triggers
+  while it runs (NEG: well under a second; POS: seconds, depending on the bias search).
+- Over TWI, `ZERO` sent with `TWI_CMD` **replies ACK at once** and runs from the main loop (it takes a fraction of a second
+  to seconds, longer than the MIPS waits). Ask `GZEROST` (also by `TWI_CMD`; it replies at once) for `NEVER`, `BUSY`,
+  `OK` or `FAILED`; a second `ZERO` while one is `BUSY` replies NAK. The binary opcode `0x0A` (`TWI_ZERO`) also sets
+  `BUSY` and starts the same background zero. `SMODE`, `CONFIG` and `SAVE` sent with `TWI_CMD` are queued and run from
+  the main loop (they reconfigure the ADC/DMA or write flash, which cannot be done inside the I2C interrupt); their
+  reply is staged when they finish, so poll the available byte count (`0x82`) until it is non-zero. Other `TWI_CMD`
+  lines reply at once. Over USB serial `ZERO` still replies when it has finished.
 
 ### DAC calibration (`BiasDAC`)
 

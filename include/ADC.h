@@ -20,7 +20,9 @@
 
 // --- Hardware resource assignments ---
 // On the Trinket M0, A3 maps to PA07 (ADC channel 7).
+#ifndef ADC_PIN
 #define ADC_PIN      A3    ///< ADC input pin  (PA07, SAMD21 ADC channel 7)
+#endif
 #define DMA_CHANNEL  0     ///< DMAC channel reserved for ADC transfers
 #define TIMER_MODULE TC4   ///< Timer/counter used to pace ADC conversions
 
@@ -76,7 +78,8 @@ void configure_event_system(void);
  *  @param bufferA     First DMA destination (uint16_t array, must stay valid).
  *  @param bufferB     Second DMA destination for ping-pong mode; 0 for single-shot.
  *  @param bufferSize  Number of 16-bit samples per buffer.
- *  @return            Actual achieved sample rate in Hz. */
+ *  @return            Actual achieved sample rate in Hz, or -1 if the DMA channel or its
+ *                     descriptors could not be set up. */
 int configureDMAADC(int gain, int freq, uint32_t bufferA, uint32_t bufferB, int bufferSize);
 
 /** Start (or restart) the DMA transfer job. */

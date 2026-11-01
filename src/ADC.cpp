@@ -335,6 +335,9 @@ void configure_event_system(void)
 static bool configure_dma_zerodma(uint32_t bufferA, uint32_t bufferB, int bufferSize)
 {
     static bool called = false;
+    static bool broken = false;   // First-time setup failed: the descriptors cannot be trusted
+
+    if (broken) return false;
 
     if (called)
     {
@@ -355,10 +358,9 @@ static bool configure_dma_zerodma(uint32_t bufferA, uint32_t bufferB, int buffer
     }
 
     // ---- First-time initialisation ----
-    called = true;
-
     // Allocate a DMA channel from the pool.
-    if (myDMA.allocate() != DMA_STATUS_OK) return false;
+    if (myDMA.allocate() != DMA_STATUS_OK) return false;   // Not marked as called: a later call retries
+    called = true;
 
     // Note: descB is always allocated below, even when the first call is
     // single-shot, so the application may later switch between single-shot
@@ -377,6 +379,7 @@ static bool configure_dma_zerodma(uint32_t bufferA, uint32_t bufferB, int buffer
         false,                       // do not increment source address
         true                         // increment destination address
     );
+    if (descA == NULL) { broken = true; return false; }
     // Fire an interrupt (TCMPL) when this descriptor's block completes.
     descA->BTCTRL.bit.BLOCKACT = DMAC_BTCTRL_BLOCKACT_INT_Val;
 
@@ -390,6 +393,7 @@ static bool configure_dma_zerodma(uint32_t bufferA, uint32_t bufferB, int buffer
         false,
         true
     );
+    if (descB == NULL) { broken = true; return false; }
     descB->BTCTRL.bit.BLOCKACT = DMAC_BTCTRL_BLOCKACT_INT_Val;
 
     // Chain B back to A to create the ping-pong loop (A → B → A → …).
@@ -510,7 +514,8 @@ void stopDMA(void)
  *  @param bufferA     First DMA destination buffer (uint16_t[bufferSize]).
  *  @param bufferB     Second buffer for ping-pong mode; 0 for single-shot.
  *  @param bufferSize  Samples per buffer.
- *  @return            Actual achieved sample rate in Hz.
+ *  @return            Actual achieved sample rate in Hz, or -1 if the DMA channel
+ *                     or its descriptors could not be set up (nothing will transfer).
  */
 int configureDMAADC(int gain, int freq, uint32_t bufferA, uint32_t bufferB, int bufferSize)
 {
@@ -519,7 +524,7 @@ int configureDMAADC(int gain, int freq, uint32_t bufferA, uint32_t bufferB, int 
     configure_adc(gain);
     configure_event_system();
 #if useZeroDma
-    configure_dma_zerodma(bufferA, bufferB, bufferSize);
+    if (!configure_dma_zerodma(bufferA, bufferB, bufferSize)) return -1;
 #else
     configure_dma(bufferA, bufferB, bufferSize);
 #endif

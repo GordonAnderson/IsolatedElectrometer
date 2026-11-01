@@ -12,9 +12,13 @@
 #define SIGNATURE  0xAA55A5A5
 
 // --- Hardware pin assignments ---
-#define TRIGIN  4    ///< Trigger input pin
+#ifndef TRIGIN
+#define TRIGIN  4    ///< Trigger input pin (Arduino pin 4; the QT Py test build overrides it)
+#endif
 #define BIAS    1    ///< Bias DAC output (DAC0 / A0)
+#ifndef CUR
 #define CUR     A3   ///< Ion-current ADC input (A3 / PA07, ADC channel 7)
+#endif
 
 // --- ASCII control codes used in the serial protocol ---
 #define ESC  27   ///< Escape character — exits TWI serial-talk mode
@@ -93,6 +97,10 @@ typedef struct
 // -------------------------------------------------------------------------
 void SetBias(void);
 void SetGain(void);
+void SetNumPoints(void);
+void ReportZeroStatus(void);
+void SetAvgSamples(void);
+void SetSampleRate(void);
 void ReportADC(void);
 void ReportSum(void);
 int  signalCounts(int counts);
