@@ -113,7 +113,9 @@ Mark each: `[ ] PASS  [ ] FAIL  [ ] SKIP`.
 ### T1. Boot with the defaults (USB)
 Send `GVER`, `GMODE`, `GNUMP`, `GANUMS`, `GSRATE`, `GCFGERR`, `GZERO`.
 Expect: `GVER` says **version 1.2**; replies for all; `GMODE` 2, `GNUMP` **100**, `GANUMS` 1000, `GSRATE` 100000, `GCFGERR` 0, `GZERO` 45000.
-Result:
+Result: **PASS** (Trinket, USB, November 1, 2026): `GVER` "IsoElectrometer, version 1.2 Oct 31, 2026"; `GMODE` 2, `GNUMP` 100,
+`GANUMS` 1000, `GSRATE`/`GSRATEA` 100000, `GCFGERR` 0, `GZERO` 45000, `GZEROST` NEVER, NEG, gain 1, bias 3.30, `GCLIP` 0,
+`GTRIGST` IDLE, `GTRIGCNT` 0. Every reply in about 50 ms.
 
 ### T2. Enter mode 1 and arm
 `SMODE,1` then `GTRIGST`, `GTRIGCNT`, `RADC`, `RSUM`, `RCUR`.
@@ -121,12 +123,18 @@ Expect: `SMODE` ACK; `GTRIGST` ARMED; `GTRIGCNT` 0 (**not** 1: no burst without 
 `SMODE,0` / `SMODE,1` / `CONFIG` with TRIGIN floating and with the MIPS LT connected, at least 5 times each);
 `RADC` and `RCUR` NAK (`?`) before the first burst, `RSUM` 0.
 Result (count of unexplained bursts out of N arms, floating / LT connected):
+**PASS** (USB, LT connected and idle): ARMED, `GTRIGCNT` 0, `RADC`/`RCUR` NAK, `RSUM` 0. Unexplained bursts: 0 of 25
+`SMODE,0`/`SMODE,1` arms, 0 of 25 `CONFIG` arms, 0 of 5 arms after `ZERO`. `GTRIGMIS` 0, `GCFGERR` 0. (TRIGIN floating not tried: LT was wired.)
 
 ### T3. Software trigger and hardware trigger
 `STRIG` three times, then `GTRIGCNT`, `RADC`, `RSUM`. Then send LT pulses from the MIPS (at least 10).
 Expect: `GTRIGCNT` rises by exactly the number of triggers; `RADC` and `RSUM` valid; `RSUM` is about `RADC * GNUMP / 16`
 (with `SCLIP 0`). Hardware pulses all counted (the arming change must not have broken the trigger interrupt).
 Result:
+**MIPS, PASS (hardware)**: LT (MIPS pin 13, idle HIGH) pulsed with `DWRITE,13,PULSE` (a few us) and `DWRITE,13,SPULSE` (1 ms):
+10 + 10 pulses, `GTRIGCNT` +10 and +10, `GTRIGMIS` 0. The trigger interrupt works after the arming change.
+**PASS (software), hardware not run**: 3 `STRIG` gave `GTRIGCNT` 3; `RSUM` 60787 against `RADC * 100 / 16` = 60781
+(`GZERO` was still 45000). LT pulses from the MIPS still to do.
 
 ### T4. ZERO over USB, mode 1, NEG, no signal
 `SCLIP,0`, `SPOL,NEG`, make one burst (`STRIG`), note `GTRIGCNT` = ____, then `ZERO`.
@@ -135,6 +143,10 @@ Expect: ACK after well under a second to a few seconds (note the time ____ s); `
 is **unchanged** and `RADC` still answers (not `?`); `GTRIGST` ARMED. Then `STRIG`: `RSUM` is near 0 (noise only,
 tens of counts at SNUMP 10).
 Result:
+**PASS**: `ZERO` ACK in 76 ms (including about 50 ms of USB round trip); `GZERO` **826** on the first ZERO and 775 to 784 on every
+later one (the first ZERO right after the bias drops from 3.3 V to 0 reads about 45 counts high: seen twice, bias settling);
+`GBIAS` 0, `GTRIGCNT` unchanged (4), `RADC` answered, ARMED. Next `STRIG`: `RSUM` 326 at SNUMP 100 (noise).
+Note: the burst baseline on this module is about 780, not the 1180 expected (October notes said about 870).
 
 ### T5. ZERO over TWI_CMD (the failing case), SNUMP 10, 100, 1000
 For each SNUMP in 100, 10, 1000: `SNUMP,n` (expect ACK; mode 1 rebuild clears the burst result), then send `ZERO`
@@ -148,11 +160,19 @@ gives `GTRIGCNT` +1.
 `GTRIGST`, `GZEROST`, `GCFGERR`, and whether power-cycling is needed. (The old malloc-based failure should be gone: buffers
 are a static pool now.)
 Result (n=100 / 10 / 1000, time to OK each, GZERO each):
+**MIPS, PASS**: `TWI1CMD,32,ZERO` at SNUMP 100 / 10 / 1000: ACK in 107 / 108 / 128 ms (USB + MIPS round trip, so at once);
+`GZEROST` already OK at the first poll (all done in about 350 ms); `GZERO` 782 / 787 / 784 (USB gave 780 to 784); `GBIAS` 0;
+`GTRIGCNT` unchanged; board answered `TWI_CMD` and `GVER` throughout; `GCFGERR` 0; next LT pulse counted each time. The second
+`ZERO` was ACKed because the first had already finished; NAK while `BUSY` was seen in T16 (POS at 100 S/s).
+**USB only (TWI_CMD not run)**: `ZERO` over USB at SNUMP 100 / 10 / 1000: ACK in 127 / 129 / 130 ms, `GZERO` 780 / 784 / 781,
+`GZEROST` OK, `GTRIGCNT` unchanged, ARMED, `GVER` answering, `GCFGERR` 0; next `STRIG` counted each time. SNUMP 1000 works.
+The `TWI_CMD` path from the MIPS (the original failure) is still to do.
 
 ### T6. ZERO by the binary opcode and by USB give the same zero
 Send `0x0A` (TWI_ZERO), wait 2 s, read `0x8C` (or `GZERO`). Compare with T4 and T5.
 Expect: the same value within a few counts.
 Result:
+**MIPS, PASS**: `STWI,01200A00,0` (0x0A), 2 s later `0x8C` 782 = `GZERO` 782, `GZEROST` OK, ARMED. Same as T5.
 
 ### T7. No reflection at zero (the original symptom)
 `SCLIP,0`, after T5 with SNUMP 10. With no signal read `RSUM` about 20 times.
@@ -160,11 +180,13 @@ Expect: near 0 (noise only, up to tens). With the electron multiplier signal (or
 NEG) `RSUM` rises from about 0 with **no fold back** at the top of the zero. If it still sits near 1500 the zero is
 still wrong: record `GZERO`, `RSUM` and the mode ZERO ran in.
 Result:
+**PASS (no signal part)**: SNUMP 10, `SCLIP 0`, 20 bursts: `RSUM` 1 to 22 (mean about 8). Signal part (no fold back) not run.
 
 ### T8. SCLIP 1
 `SCLIP,1`, same input. Expect: `RSUM` 0 or small positive noise at the baseline, signal positive, nothing negative.
 `SCLIP,0` again afterwards.
 Result:
+**PASS (no signal part)**: `SCLIP 1`, 20 bursts: 14 zeros, the rest 4 to 12, nothing negative. `SCLIP 0` restored.
 
 ### T9. Settings take effect at once and refuse bad values (USB and TWI_CMD)
 In mode 1 with a valid burst held: `SNUMP,200` then `GNUMP`, `GTRIGST`, `RADC`.
@@ -176,6 +198,12 @@ burst at 5000 points works if accepted (note: 50 ms at 100 kS/s). Then `SNUMP,10
 Also `SSRATE,50000` -> `GSRATEA` 50000 right after, a burst takes twice as long; `SSRATE,99` and `SSRATE,100001` NAK; `SSRATE,100000` ACK and `GSRATEA` 100000; a 1000 point burst takes about 10 ms.
 `SANUMS,100` in mode 1 only stores (no rebuild); `SANUMS,9`, `SANUMS,10001` NAK.
 Result:
+**PASS**: `SNUMP,200` ACK, `GNUMP` 200, `RADC` NAK until the next `STRIG`; `SNUMP,5/5001/abc` NAK, unchanged; `SNUMP,5000`
+**ACK** and the burst runs (`GCFGERR` 0); `SSRATE,50000` gives `GSRATEA` 50000; `SSRATE,99/100001` NAK; `SANUMS,100` in mode 1 stores
+only; `SANUMS,9/10001` NAK. Burst timing (from `STRIG` until `GTRIGCNT` changes, polled over USB, so +40 to 90 ms): 1000 points at
+1 kS/s 1078 to 1090 ms, at 2 kS/s 536 to 546 ms, 5000 at 1 kS/s 5061 to 5085 ms, 5000 at 10 kS/s 533 to 544 ms. The rate is right
+(the 1/3 bug is fixed on the Trinket). Sum scaling with a DC level (`SZERO,0`, `SBIAS,0.5`): `RSUM` / (`RADC * N / 16`) = 1.00009,
+1.00009, 1.00002 at N = 100, 1000, 5000.
 
 ### T10. Mode 2 and the scale fix
 `SMODE,2`, no signal then a steady input (a DC level on the input). Read `RADC` several times, then `SMODE,1`,
@@ -184,18 +212,25 @@ Expect: mode 2 `RADC` equals the mode 1 `RADC` within noise and normal drift (**
 55022 vs 54577); no jump to 0 and ramp up after `SMODE,2` (the filter seeds from the first buffer). `SANUMS,10` and
 `SANUMS,15` in mode 2 do not hang or give 0 (the divide-by-zero fix). `SANUMS,1000` afterwards.
 Result (mode 1 RADC / mode 2 RADC):
+**PASS** (`SZERO,0` so `RADC` is raw): quiet input, mode 1 (N=1000) 767 to 785, mode 2 776 to 778 from the first read (no ramp
+from 0); `SBIAS,0.5`: mode 1 9275 to 9278, mode 2 9269 to 9276 (old +0.8% would be +75). `SANUMS` 100 / 10 / 15 run: 776 / **760** /
+772 (10 reads 17 low: the small-SANUMS dead band in TODO). Mode 0 at 0.5 V: 9248 to 9440 (noisy).
 
 ### T11. ZERO in mode 2 and mode 0
 `SMODE,2` then `ZERO`: ACK, `GZERO` close to the mode 1 value (burst path), mode 2 keeps running (`RADC` answers).
 `SMODE,0` then `ZERO`: ACK; `GZERO` is the idle `analogRead()` value (different from the burst baseline; record both:
 ____ idle, ____ burst); mode 0 `RADC` works. Then `SMODE,1`.
 Result:
+**PASS**: mode 2 `ZERO` ACK 128 ms, `GZERO` 782, mode kept, `RADC` 9. Mode 0 `ZERO` ACK 147 ms, `GZERO` **3637** (idle
+`analogRead`) against **780** (burst): the gap of about 2860 counts is present on this module. Mode 1 `ZERO` 780.
 
 ### T12. POS polarity
 `SPOL,POS`, `SMODE,1`, `ZERO`. Note the time (could be several seconds).
 Expect: ACK; `GBIAS` below 3.3 / gain; `GZERO` below 65000; board keeps answering; triggers re-arm. Return to
 `SPOL,NEG`, `ZERO`.
 Result:
+**PASS**: `SPOL,POS` `ZERO` ACK in 0.13 s, `GZERO` 54695, `GBIAS` 3.30 (the first reading at 3.3 V was already below 65000,
+so the bias walk did not step), ARMED, next `STRIG` counted, `RCUR` -0.01. Back to NEG: `ZERO` 823 then 778 (settling, see T4).
 
 ### T13. Deferred TWI_CMD commands
 Over `TWI_CMD` send `SMODE,1`, `CONFIG`, `SAVE`, then quick lines `GNUMP`, `GZERO`, `GMODE`, `SNUMP,100`.
@@ -203,6 +238,9 @@ Expect: `ZERO` ACKs at once and `GZEROST` goes BUSY then OK; `SMODE`, `CONFIG`, 
 code polls long enough or reads 0 bytes and gives up: if it gives up this is a MIPS-side retry change, record it);
 the quick lines reply immediately; `SNUMP,100` is ACKed immediately and applied right after.
 Result:
+**MIPS, PASS**: `TWI1CMD,32,` `SMODE,1` ACK 110 ms, `CONFIG` ACK 125 ms, `SNUMP,100` ACK 123 ms, `SAVE` ACK 110 ms, then `GNUMP` 100,
+`GZERO` 782, `GMODE` 1 (106 to 111 ms each); ARMED, `GCFGERR` 0. The deferred replies arrived inside the MIPS's 250 ms read
+window, so no MIPS retry change is needed. **Saved image now: mode 1, SNUMP 100, zero 782, gain 1, bias 0, filter 10.**
 
 ### T14. Limits and rollback paths
 a. `SNUMP,5001`, `SANUMS,3001`, `SANUMS,10000` NAK at the setter and the value is unchanged. `SNUMP,5000` and
@@ -215,6 +253,10 @@ c. Rollback after a real rebuild failure cannot be forced with memory any more (
    accept). It is covered by the code path only: a failed DMA channel setup would count in `GCFGERR` and restore the
    old mode and sizes.
 Result:
+**PASS** (a, b): `SNUMP,5001`, `SANUMS,3001`, `SANUMS,10000` NAK, unchanged. `SNUMP,5000` + `SANUMS,3000` accepted; 5000 point
+burst OK, mode 2 at 3000 runs; 100 x (`SMODE,2`, `SMODE,1`): 0 NAK, `GCFGERR` 0; `ZERO` at SNUMP 5000 ACK (783). `RESTORE` with
+nothing saved: NAK. `SAVE` (mode 1, NEG, SNUMP 100, SANUMS 1000, zero 776, bias 0), `SNUMP,200`, `RESTORE`: ACK, `GNUMP` 100,
+`RADC` NAK (cleared), ARMED, `GZERO` 776, `GCFGERR` 0. **The board now has this image saved.**
 
 ### T15. I2C setters reject bad values
 Through the MIPS or an I2C tool, each followed by the matching read-back (all on address 0x20): `0x03` TWI_SET_MODE
@@ -222,6 +264,9 @@ with byte 5 (expect `GMODE` unchanged); `0x04` TWI_SET_GAIN with bytes 3 and 0 (
 `0x07` TWI_SET_BIAS with float 4.0, -1.0 and NaN (expect `GBIAS` unchanged; 0.5 is valid); `0x08` TWI_SET_FILTER with
 float 0 and 100000 (expect `GFILTER` unchanged; 10 is valid). Restore the values afterwards.
 Result:
+**MIPS, PASS**: `STWI,0120<op><fmt>,v`, read back with `TWI_CMD`. Ignored (values unchanged): mode 5 (`0314`), gain 3 and 0
+(`0414`), bias 4.0, -1.0, nan (`0746`), filter 0 and 100000 (`0846`). Applied: gain 4, bias 0.5, filter 20. Restored gain 1,
+bias 0, filter 10. (The MIPS `STWI` replies ACK in every case; only the electrometer refuses.)
 
 ### T16. During ZERO
 While a `ZERO` runs (POS gives the longest window): send `STRIG` (expect NAK), `GMODE`, `GZERO`, an LT pulse.
@@ -229,43 +274,68 @@ Expect: `STRIG` NAK; USB/TWI reads still answered; the LT pulse produces no burs
 `GTRIGST` ARMED and `GTRIGCNT` unchanged. (`GMODE` over TWI may briefly show a different mode while ZERO runs; note
 what you see.)
 Result:
+**MIPS, PASS** (SSRATE 100, POS, ZERO about 0.35 s): during `BUSY` a `TWI_CMD` `STRIG` and a second `ZERO` both NAK; `GMODE`,
+`GZERO` and `0x83` are answered (mode reads 1 throughout). 8 timed LT pulses: the 4 sent while `GZEROST` was still `BUSY` made
+no burst; pulses right after OK (about 0.4 s) made none, and at about 0.5 s (re-armed) made one, as they should. So an edge
+during ZERO is dropped, not latched. `GTRIGMIS` stays 0 for those edges (1.2 ignores edges while not armed). Afterwards ARMED,
+`GCFGERR` 0. (A first run looked like a burst from a pulse during ZERO; the pulse was in fact after the ZERO had ended.)
 
 ### T17. Regression
 Hardware LT burst, `0x8B` (count and sum agree with `GTRIGCNT` and `RSUM`), `0xA1` agrees with `RADC`, `0xA2` agrees
 with `RCUR`, `RCUR` sign: negative current into NEG gives a negative `RCUR`. Before the first burst after a rebuild
 `0xA1` and `0xA2` read 0 (not garbage) while serial `RADC` NAKs.
 Result:
+**MIPS, PASS**: before the first burst and again after a rebuild (`SNUMP,100`) `0xA1` 0 and `0xA2` 0.00 while `RADC`/`RCUR` NAK.
+5 LT bursts: `0x8B` (read 4 bytes, `GTWI,01208B42`) count = `GTRIGCNT` and sum low byte = `RSUM & 0xFF` every time (the MIPS
+prints that byte signed: -114 = 142); `0xA1` = `RADC`, `0xA2` = `RCUR`. The `RCUR` sign with real current not tested (no signal).
+**MIPS bug:** `gtwi()` reads into `uint8_t bptr[4]`, so `GTWI,01208B72` (7 bytes, as in the October notes) overruns the MIPS stack
+by 3 bytes. Read 4 bytes, or fix `gtwi()` to size the buffer from the request.
 
 ### T18. Soak
 30 minutes in mode 1 with the MIPS scanning (LT pulses) and the MIPS reading `0x8B` each scan, with one `ZERO` and
 one `SNUMP` change in the middle. Expect: no hangs or resets, `GTRIGMIS` only from pulses during bursts or ZERO,
 `GCFGERR` 0.
 Result:
+**MIPS, short soak PASS (30 min run still to do)**: emulated scan from the MIPS serial port: `DWRITE,13,PULSE` then
+`GTWI,01208B42` after each pulse. 2 min: 534 pulses, each read back as exactly count + 1 in `0x8B`, no missing reply; `ZERO` at
+48 s (`TWI_CMD`, OK, 788) and `SNUMP,10` at 72 s in the middle; afterwards `GCFGERR` 0, `GTRIGMIS` 0, ARMED. An earlier 5 min
+stretch of the 30 min run (stopped at the user's request) gave 1352 of 1352. The real MIPS QUAD scan was not used.
+**USB part PASS (120 s, not 30 min, no MIPS)**: 1107 commands, 498 `STRIG` ACK, 111 random `ZERO` / `SNUMP` / `SSRATE` /
+`CONFIG` / `GVER` events, no missing reply, no hang or reset; afterwards `GCFGERR` 0, `GTRIGMIS` 0, ARMED. MIPS scan soak still to do.
 
 ## 5. Summary (fill in at the end)
 
 | Test | Result | Notes |
 |------|--------|-------|
-| T1 | | |
-| T2 | | |
-| T3 | | |
-| T4 | | |
-| T5 | | |
-| T6 | | |
-| T7 | | |
-| T8 | | |
-| T9 | | |
-| T10 | | |
-| T11 | | |
-| T12 | | |
-| T13 | | |
-| T14 | | |
-| T15 | | |
-| T16 | | |
-| T17 | | |
-| T18 | | |
+| T1 | PASS | Trinket, USB |
+| T2 | PASS | 0 of 55 arms, LT idle |
+| T3 | PASS | sw + 20 of 20 LT pulses |
+| T4 | PASS | GZERO 780 (826 first, bias settling) |
+| T5 | PASS | TWI_CMD ZERO ACK at once, zero 782-787 |
+| T6 | PASS | 0x0A zero = 782 |
+| T7 | PASS (quiet) | signal part not run |
+| T8 | PASS (quiet) |  |
+| T9 | PASS | rate correct |
+| T10 | PASS | mode 2 = mode 1 |
+| T11 | PASS | idle 3637 vs burst 780 |
+| T12 | PASS | bias did not need to step |
+| T13 | PASS | deferred replies in 110-125 ms; SAVE done |
+| T14 | PASS | a, b; image saved |
+| T15 | PASS | all bad I2C values ignored |
+| T16 | PASS | edges during ZERO dropped, not latched |
+| T17 | PASS | 0x8B/0xA1/0xA2 agree; RCUR sign not tested |
+| T18 | PASS (short) | 2 min + 5 min, 1886 of 1886 pulses; 30 min still to do |
 
 Failures and anything unexpected, with the exact commands and replies:
+- November 1, 2026, Trinket over USB (MIPS on I2C and LT on TRIGIN, both idle, input quiet), run by Claude: **no failures.**
+- The first `ZERO` after the bias drops from 3.3 V to 0 reads about 45 counts high (826, 823 against 775 to 784). Seen twice.
+  Probably the bias DAC / front end settling; `zero()` may need a longer wait after `applyBias()`.
+- Burst baseline on this module is about 780 counts in NEG at gain 1, not the 1180 the checklist expected.
+- Idle (`analogRead`) zero 3637 against burst 780: the 2860 count gap is real on this module.
+- MIPS session (MIPS 1.269 on USB, electrometer on Wire1 0x20, LT on TRIGIN): no electrometer failures. The bias settling
+  effect showed again: the first NEG `ZERO` after a POS run read 833 to 841 (usual 782).
+- MIPS `gtwi()` overruns its 4-byte buffer for reads longer than 4 bytes (`GTWI,01208B72`).
+- Mode 2 at `SANUMS` 10 reads 17 counts low (760 against 777): the dead band already noted in TODO.
 
 Open questions to bring back to the development machine:
 - Did SNUMP 1000 work now? If not, where did it fail and what was the state?
